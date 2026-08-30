@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+/data/
+/reports/
+.omc/
+.env
+.env.*
+*.env
+*.key
+*.pem
+secrets*
+**/credentials*

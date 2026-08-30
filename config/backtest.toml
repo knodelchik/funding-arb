@@ -1,0 +1,18 @@
+# funding-arb backtest config. Fee scenarios default to the two documented in
+# farb.config (taker worst-case, maker+BNB best-case) when omitted here.
+
+symbols = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+    "LTCUSDT", "BCHUSDT", "TRXUSDT", "NEARUSDT", "ATOMUSDT",
+    "FILUSDT", "ETCUSDT", "APTUSDT", "SUIUSDT", "ARBUSDT",
+]
+data_root = "data"
+notional_usdt = 10000
+
+ema_periods = 6
+enter_apr = 0.12
+exit_apr = 0.02
+
+sensitivity_enter_apr = [0.08, 0.12, 0.20]
+sensitivity_exit_apr = [0.0, 0.02, 0.05]

@@ -1,0 +1,52 @@
+# M2 paper executor config. Universe: verified top HL carry names that have a
+# Binance hedge (spot preferred; perp where spot is unlisted).
+capital_usd = 100000
+max_positions = 5
+
+[[universe]]
+symbol = "HYPEUSDT"
+hl_coin = "HYPE"
+hedge_mode = "perp"     # no Binance spot for HYPE
+max_notional = 20000
+
+[[universe]]
+symbol = "PUMPUSDT"
+hl_coin = "PUMP"
+hedge_mode = "perp"
+max_notional = 10000
+
+[[universe]]
+symbol = "AAVEUSDT"
+hl_coin = "AAVE"
+hedge_mode = "spot"
+max_notional = 20000
+
+[[universe]]
+symbol = "LDOUSDT"
+hl_coin = "LDO"
+hedge_mode = "spot"
+max_notional = 15000
+
+[[universe]]
+symbol = "PENDLEUSDT"
+hl_coin = "PENDLE"
+hedge_mode = "spot"
+max_notional = 15000
+
+[[universe]]
+symbol = "UNIUSDT"
+hl_coin = "UNI"
+hedge_mode = "spot"
+max_notional = 20000
+
+[[universe]]
+symbol = "LINKUSDT"
+hl_coin = "LINK"
+hedge_mode = "spot"
+max_notional = 20000
+
+[[universe]]
+symbol = "TAOUSDT"
+hl_coin = "TAO"
+hedge_mode = "spot"
+max_notional = 15000

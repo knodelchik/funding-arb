@@ -26,6 +26,10 @@ def main() -> None:
     p_bt.add_argument("--config", type=Path, default=Path("config/backtest.toml"))
     p_bt.add_argument("--reports-dir", type=Path, default=Path("reports"))
 
+    p_paper = sub.add_parser("paper", help="M2 paper executor (HL-hybrid, virtual fills)")
+    p_paper.add_argument("action", choices=["tick", "status", "report"])
+    p_paper.add_argument("--config", type=Path, default=Path("config/paper.toml"))
+
     args = parser.parse_args()
 
     if args.command == "collect":
@@ -38,6 +42,11 @@ def main() -> None:
         from farb.config import load_config
 
         run_backtest(cfg=load_config(args.config), reports_dir=args.reports_dir)
+    elif args.command == "paper":
+        from farb.paper.engine import run_paper
+        from farb.paper.models import load_paper_config
+
+        run_paper(action=args.action, cfg=load_paper_config(args.config))
 
 
 if __name__ == "__main__":

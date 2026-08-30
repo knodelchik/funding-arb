@@ -26,6 +26,9 @@ packages = ["src/farb"]
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+# research/ holds session-generated experiment scripts kept for reproducibility,
+# not library code — linting them adds noise without value.
+exclude = ["research"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]

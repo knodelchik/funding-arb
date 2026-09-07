@@ -18,7 +18,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from farb.paper import broker, engine, journal
+from farb.paper import broker, engine, journal, report
 from farb.paper.models import Fill, HedgeMode, PaperConfig, Position, SymbolSpec
 from farb.schemas import KLINE_SCHEMA
 
@@ -995,9 +995,11 @@ def test_tick_writes_parquet_mirror_of_the_journal(tmp_path: Path) -> None:
 
 
 def test_entry_notional_capped_by_liquidity(tmp_path: Path) -> None:
-    """0.5% of trailing-30d median hourly quote volume caps entry notional
+    """0.5% of trailing-30d median 4-HOUR quote volume caps entry notional
     below the static max_notional/capital-per-slot caps when the symbol is
-    thin.
+    thin. With a constant hourly quote volume of 1000, each 4h bucket sums
+    to 4000 (median of an all-4000 series is still 4000), so the cap is
+    0.5% of 4000, not of a single hour's 1000.
     """
     thin_spec = SymbolSpec(
         symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=1_000_000
@@ -1011,7 +1013,7 @@ def test_entry_notional_capped_by_liquidity(tmp_path: Path) -> None:
         {
             "symbol": ["FOOUSDT"] * hours, "open_time": times,
             "open": closes, "high": closes, "low": closes, "close": closes,
-            "volume": [100.0] * hours,  # quote volume = close*volume = 1000.0 constant
+            "volume": [100.0] * hours,  # hourly quote volume = close*volume = 1000.0 constant
         },
         schema=KLINE_SCHEMA,
     )
@@ -1020,7 +1022,94 @@ def test_entry_notional_capped_by_liquidity(tmp_path: Path) -> None:
     df.write_parquet(path)
 
     notional = engine._entry_notional(cfg, journal.PaperState(), thin_spec, now=T0)
-    assert notional == pytest.approx(0.005 * 1000.0)
+    assert notional == pytest.approx(0.005 * 4000.0)
+
+
+def test_liquidity_cap_uses_4h_bucketed_median_quote_volume(tmp_path: Path) -> None:
+    """0.5% of the trailing-30d median 4-HOUR (not 1h) quote volume. Build
+    klines where each of 3 complete 4h buckets has a distinguishable,
+    hand-computed total quote volume — bucket0=4*10*10=400,
+    bucket1=4*10*20=800, bucket2=4*10*30=1200 — and check the cap matches
+    0.5% of the MEDIAN across buckets (800), not of any single hour.
+    """
+    spec = SymbolSpec(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=1_000_000
+    )
+    cfg = _make_cfg(tmp_path, universe=[spec], capital_usd=1_000_000, max_positions=1)
+
+    hours = 12
+    times = [T0 - timedelta(hours=hours - i) for i in range(hours)]
+    closes = [10.0] * hours
+    volumes = [10.0] * 4 + [20.0] * 4 + [30.0] * 4
+    df = pl.DataFrame(
+        {
+            "symbol": ["FOOUSDT"] * hours, "open_time": times,
+            "open": closes, "high": closes, "low": closes, "close": closes,
+            "volume": volumes,
+        },
+        schema=KLINE_SCHEMA,
+    )
+    path = cfg.data_root / "binance" / "klines_spot_1h" / "FOOUSDT.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(path)
+
+    cap = engine._liquidity_cap(cfg, spec, T0)
+    assert cap == pytest.approx(0.005 * 800.0)
+
+
+def test_entry_skipped_when_liquidity_cap_below_min_notional(tmp_path: Path) -> None:
+    """A symbol whose liquidity cap computes below MIN_ENTRY_NOTIONAL must
+    not be entered at all (not entered with a tiny position) — the logged
+    decision is 'skip_below_min_notional', not 'enter'.
+    """
+    thin_spec = SymbolSpec(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=1_000_000
+    )
+    cfg = _make_cfg(
+        tmp_path, universe=[thin_spec], capital_usd=1_000_000, max_positions=1, maker_fill_prob=1.0
+    )
+
+    # 4h-bucketed quote volume = 4*1*25 = 100 -> cap = 0.5%*100 = 0.5, well
+    # under the $2000 floor.
+    hours = 24 * 30
+    times = [T0 - timedelta(hours=hours - i) for i in range(hours)]
+    closes = [1.0] * hours
+    df = pl.DataFrame(
+        {
+            "symbol": ["FOOUSDT"] * hours, "open_time": times,
+            "open": closes, "high": closes, "low": closes, "close": closes,
+            "volume": [25.0] * hours,
+        },
+        schema=KLINE_SCHEMA,
+    )
+    path = cfg.data_root / "binance" / "klines_spot_1h" / "FOOUSDT.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(path)
+
+    hour0 = journal.hour_bucket(T0)
+    warmup = _hourly_rates(hour0 - timedelta(hours=9), [0.0002] * 9, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0002, mark_px=100.0)},
+        funding={"FOO": warmup},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}}
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    snapshots = [
+        e["payload"] for e in events
+        if e["type"] == journal.SIGNAL_SNAPSHOT and e["payload"]["symbol"] == "FOOUSDT"
+    ]
+    assert len(snapshots) == 1
+    assert snapshots[0]["decision"] == "skip_below_min_notional"
 
 
 def test_hedge_funding_missing_mark_price_falls_back_and_warns_once(tmp_path: Path) -> None:
@@ -1069,3 +1158,89 @@ def test_hedge_funding_missing_mark_price_falls_back_and_warns_once(tmp_path: Pa
     warnings = [e for e in events if e["type"] == journal.WARNING]
     assert len(warnings) == 1
     assert position.funding_paid_usd == pytest.approx(expected)
+
+
+# --------------------------------------------------------------------------
+# 14. Basis MtM must use a LIVE hedge mark, not the one frozen at entry
+# --------------------------------------------------------------------------
+
+
+def test_basis_mtm_uses_refreshed_hedge_mark_not_entry_frozen_price(tmp_path: Path) -> None:
+    """Both legs' prices move by the SAME amount (a parallel shift — no
+    real basis change) -> unrealized basis MtM must stay ~0. A bug that
+    never refreshes the hedge mark after entry (report compares a LIVE HL
+    mark against a STALE, entry-frozen hedge price) would show a large
+    nonzero basis_mtm here, since only the HL leg's stored mark would have
+    moved.
+    """
+    cfg = _make_cfg(tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0)
+    hour0 = journal.hour_bucket(T0)
+    warmup = _hourly_rates(hour0 - timedelta(hours=9), [0.0002] * 9, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0002, mark_px=100.0)},
+        funding={"FOO": warmup},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}}
+    )
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions
+    pos = state.open_positions["FOOUSDT"]
+    entry_hl = next(f.price for f in pos.entry_fills if f.leg == "hl_short")
+    entry_hedge = next(f.price for f in pos.entry_fills if f.leg == "hedge_long")
+
+    # Move BOTH marks up by the same +10 -> no real basis change, whatever
+    # the entry-time HL-vs-hedge gap happened to be.
+    hl.ctxs["FOO"] = FakeAssetCtx(coin="FOO", funding_hourly=0.0002, mark_px=entry_hl + 10.0)
+    hl.books["FOO"] = FakeBookTop(
+        coin="FOO", best_bid=entry_hl + 9.0, best_ask=entry_hl + 11.0
+    )
+    binance.book_tickers["FOOUSDT"] = {
+        "askPrice": str(entry_hedge + 10.0), "bidPrice": str(entry_hedge + 10.0),
+    }
+
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=1)
+    )
+
+    state = journal.replay(journal.journal_path(cfg))
+    marks = state.last_marks["FOOUSDT"]
+    assert marks["hedge_price"] == pytest.approx(entry_hedge + 10.0)  # NOT frozen at entry
+
+    basis_mtm = report._open_position_basis_mtm(state.open_positions["FOOUSDT"], marks)
+    assert basis_mtm == pytest.approx(0.0, abs=1e-6)
+
+
+def test_refresh_hedge_mark_carries_previous_on_fetch_failure(tmp_path: Path) -> None:
+    """A hedge-mark fetch failure must carry forward the previous mark (not
+    overwrite it with a stale/wrong value or drop it), and log a warning.
+    """
+    cfg = _make_cfg(tmp_path, universe=[PERP_SPEC])
+    position = Position(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.PERP, qty=10.0,
+        notional_entry=1000.0, entry_ts=T0,
+        entry_fills=[
+            Fill(venue="hyperliquid", leg="hl_short", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=True, ts=T0),
+            Fill(venue="binance", leg="hedge_long", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=False, ts=T0),
+        ],
+        funding_received_usd=0.0, funding_paid_usd=0.0, signal_apr_at_entry=0.5,
+    )
+    state = journal.PaperState()
+    state.open_positions["FOOUSDT"] = position
+    state.last_marks["FOOUSDT"] = {"hl_mark_px": 100.0, "hedge_price": 101.5}
+
+    binance = FakeBinanceClient(book_tickers={})  # lookup raises KeyError -> simulated failure
+
+    engine._refresh_hedge_mark(cfg, state, position, binance, now=T0 + timedelta(hours=1))
+
+    assert state.last_marks["FOOUSDT"]["hedge_price"] == pytest.approx(101.5)  # carried forward
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    warnings = [e for e in events if e["type"] == journal.WARNING]
+    assert len(warnings) == 1
+    assert "hedge mark fetch failed" in warnings[0]["payload"]["message"]

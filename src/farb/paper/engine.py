@@ -58,10 +58,25 @@ WARMUP_MARGIN_HOURS = 24
 MAINT_MARGIN_FRACTION = 0.0125
 
 # Position sizing liquidity cap: never risk more than 0.5% of the trailing
-# 30d median HOURLY quote volume on one position (so paper size stays
-# realistic even when max_notional/capital would allow more).
+# 30d median quote volume on one position (so paper size stays realistic
+# even when max_notional/capital would allow more).
 LIQUIDITY_CAP_FRACTION = 0.005
 LIQUIDITY_LOOKBACK_HOURS = 24 * 30
+# Participation base: quote volume is summed over rolling 4h windows (not
+# taken per-hour) before the median is computed. A position here is
+# typically HELD for days, so its execution risk amortizes across many
+# hours of trading, not one — capping against a single hour's volume (which
+# can be spiky/thin) was too conservative in practice: week-1 paper entries
+# got capped to sub-$2k notionals, where taker/maker fees on entry+exit ate
+# the whole funding edge (e.g. one closed UNI trade: fees $5.74 vs funding
+# $1.92 over 2.2 days held). A 4h base better reflects the volume a
+# position can realistically trade into/out of over a meaningful slice of
+# its holding period, while staying far shorter than that holding period
+# (days) so it's still a genuinely conservative cap, not a loophole.
+LIQUIDITY_WINDOW_HOURS = 4
+# Hard floor: below this, fees on entry+exit reliably exceed any realistic
+# funding edge over a typical holding period — not worth opening at all.
+MIN_ENTRY_NOTIONAL = 2_000.0
 
 
 @dataclass
@@ -188,6 +203,16 @@ def _hourly_funding_series(
     return sorted(merged.items())
 
 
+def _binance_bookticker(binance_client: Any, symbol: str, hedge_mode: HedgeMode) -> dict[str, Any]:
+    from farb.data.client import FAPI_BASE, SPOT_BASE
+
+    if hedge_mode == HedgeMode.SPOT:
+        base, path = SPOT_BASE, "/api/v3/ticker/bookTicker"
+    else:
+        base, path = FAPI_BASE, "/fapi/v1/ticker/bookTicker"
+    return binance_client.get(base, path, {"symbol": symbol})
+
+
 def _binance_book_price(
     binance_client: Any, symbol: str, hedge_mode: HedgeMode, side: str
 ) -> float:
@@ -196,23 +221,58 @@ def _binance_book_price(
     is spot, else USDT-perp. Takes symbol/hedge_mode directly (not a
     SymbolSpec) so this works from a Position after universe removal too.
     """
-    from farb.data.client import FAPI_BASE, SPOT_BASE
-
-    if hedge_mode == HedgeMode.SPOT:
-        base, path = SPOT_BASE, "/api/v3/ticker/bookTicker"
-    else:
-        base, path = FAPI_BASE, "/fapi/v1/ticker/bookTicker"
-    row = binance_client.get(base, path, {"symbol": symbol})
+    row = _binance_bookticker(binance_client, symbol, hedge_mode)
     return float(row["askPrice"] if side == "ask" else row["bidPrice"])
 
 
+def _refresh_hedge_mark(
+    cfg: PaperConfig, state: PaperState, position: Position, binance_client: Any, now: datetime
+) -> None:
+    """Fetch the CURRENT hedge-side mark (mid of bid/ask) and store it in
+    last_marks, every tick an open position exists — not just when a
+    hedge-perp funding event happens to settle.
+
+    Without this, `last_marks[symbol]["hedge_price"]` only ever gets set at
+    entry (and, for a perp hedge, refreshed incidentally by
+    `_accrue_hedge_perp` roughly every 8h) — for a spot hedge it NEVER
+    updates again before close. The unrealized basis MtM then compares a
+    fresh, ticking HL mark against a stale, entry-frozen hedge price: one
+    leg's price move shows up as "basis" in the display even though the
+    position is genuinely hedged. On a fetch failure the previous mark is
+    carried forward (not overwritten with a stale/wrong value) and a
+    warning is logged.
+    """
+    try:
+        row = _binance_bookticker(binance_client, position.symbol, position.hedge_mode)
+        mid = (float(row["askPrice"]) + float(row["bidPrice"])) / 2
+    except Exception as exc:  # noqa: BLE001 - a hedge-mark fetch failure must not crash the tick
+        journal.append_event(
+            cfg, journal.WARNING,
+            {
+                "symbol": position.symbol,
+                "message": f"hedge mark fetch failed, carrying previous mark: {exc}",
+            },
+            now,
+        )
+        return
+    # Journaled (not just set in-memory): PaperState is rebuilt fresh from
+    # the journal on every tick via replay(), so a mark update that isn't
+    # recorded here is invisible on the very next tick.
+    journal.append_event(
+        cfg, journal.HEDGE_MARK_REFRESHED, {"symbol": position.symbol, "hedge_price": mid}, now
+    )
+    state.last_marks.setdefault(position.symbol, {})["hedge_price"] = mid
+
+
 def _liquidity_cap(cfg: PaperConfig, spec: SymbolSpec, cfg_now: datetime) -> float | None:
-    """0.5% of the trailing-30d median HOURLY quote volume (close*volume),
-    from the collected Binance klines — spot klines for a spot hedge, perp
-    klines for a perp hedge (the venue the hedge leg actually trades on).
-    None (no cap from this source) if that parquet is missing/unreadable
-    or has no rows in the lookback window; the caller is responsible for
-    warning in that case.
+    """0.5% of the trailing-30d median 4-HOUR quote volume (close*volume,
+    summed over rolling/bucketed LIQUIDITY_WINDOW_HOURS-hour windows —
+    see that constant's comment for why 4h rather than 1h), from the
+    collected Binance klines — spot klines for a spot hedge, perp klines
+    for a perp hedge (the venue the hedge leg actually trades on). None (no
+    cap from this source) if that parquet is missing/unreadable or has no
+    rows in the lookback window; the caller is responsible for warning in
+    that case.
     """
     dataset = "klines_spot_1h" if spec.hedge_mode == HedgeMode.SPOT else "klines_perp_1h"
     path = cfg.data_root / "binance" / dataset / f"{spec.symbol}.parquet"
@@ -221,13 +281,20 @@ def _liquidity_cap(cfg: PaperConfig, spec: SymbolSpec, cfg_now: datetime) -> flo
     try:
         df = pl.read_parquet(path)
         cutoff = cfg_now - timedelta(hours=LIQUIDITY_LOOKBACK_HOURS)
-        recent = df.filter(pl.col("open_time") >= cutoff)
-        quote_volumes = (recent["close"] * recent["volume"]).to_list()
+        recent = df.filter(pl.col("open_time") >= cutoff).sort("open_time")
+        bucketed = (
+            recent.with_row_index("_idx")
+            .with_columns((pl.col("_idx") // LIQUIDITY_WINDOW_HOURS).alias("_bucket"))
+            .with_columns((pl.col("close") * pl.col("volume")).alias("_qv"))
+            .group_by("_bucket")
+            .agg(pl.col("_qv").sum())
+        )
+        window_volumes = bucketed["_qv"].to_list()
     except Exception:  # noqa: BLE001 - a bad klines parquet must degrade, not crash
         return None
-    if not quote_volumes:
+    if not window_volumes:
         return None
-    return LIQUIDITY_CAP_FRACTION * statistics.median(quote_volumes)
+    return LIQUIDITY_CAP_FRACTION * statistics.median(window_volumes)
 
 
 def _entry_notional(cfg: PaperConfig, state: PaperState, spec: SymbolSpec, now: datetime) -> float:
@@ -256,11 +323,16 @@ def _open_position(
     hl_client: Any,
     binance_client: Any,
     ema_apr: float,
+    notional: float,
     now: datetime,
 ) -> None:
+    """`notional` is precomputed by the caller (via `_entry_notional`) at
+    candidate-filtering time, not here — the MIN_ENTRY_NOTIONAL floor has
+    to reject a candidate BEFORE it's ranked/slotted, not after opening a
+    tiny position.
+    """
     hl_book = hl_client.book_top(spec.hl_coin)
     hedge_price = _binance_book_price(binance_client, spec.symbol, spec.hedge_mode, side="ask")
-    notional = _entry_notional(cfg, state, spec, now)
     fills = broker.open_pair(spec, notional, hl_book, hedge_price, now, cfg)
     hl_fill, hedge_fill = fills
 
@@ -435,8 +507,19 @@ def _accrue_hl(
     an event settling AT the top of the entry hour (e.g. entry at 14:35,
     event at 14:00) settled BEFORE the position existed and must not be
     accrued to it.
+
+    Whenever an hour IS accrued, its own FUNDING_ACCRUED event already
+    carries `mark_px` and journal.py's replay applies it to last_marks —
+    that's sufficient. But if there's nothing new to accrue this call (e.g.
+    entry landed exactly on an hour boundary, leaving no accruable hour
+    before the very next tick), the current mark would otherwise only be
+    set in-memory on `state` here and never persisted: PaperState is
+    rebuilt fresh from the journal on every tick, so an unjournaled mutation
+    made now is invisible on the next replay. HL_MARK_REFRESHED covers
+    exactly that gap.
     """
     symbol = position.symbol
+    accrued_any = False
     for t, rate in hourly:
         if t <= position.entry_ts or t >= hour:
             continue
@@ -447,6 +530,7 @@ def _accrue_hl(
         state.hl_accrual_keys.add(key)
         state.hl_funding_history.setdefault(symbol, {})[key[1]] = rate
         position.funding_received_usd += amount
+        accrued_any = True
         journal.append_event(
             cfg, journal.FUNDING_ACCRUED,
             {
@@ -454,6 +538,10 @@ def _accrue_hl(
                 "rate": rate, "mark_px": mark_px, "qty": position.qty, "amount_usd": amount,
             },
             now,
+        )
+    if not accrued_any:
+        journal.append_event(
+            cfg, journal.HL_MARK_REFRESHED, {"symbol": symbol, "hl_mark_px": mark_px}, now
         )
     state.last_marks.setdefault(symbol, {})["hl_mark_px"] = mark_px
 
@@ -618,6 +706,7 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
             _accrue_hl(cfg, state, position, sig.hourly, sig.ctx.mark_px, hour, now)
         if position.hedge_mode == HedgeMode.PERP:
             _accrue_hedge_perp(cfg, state, position, binance_client, now)
+        _refresh_hedge_mark(cfg, state, position, binance_client, now)
 
         liquidated = can_price and _check_liquidation(
             cfg, state, position, sig.ctx.mark_px, binance_client, now
@@ -651,7 +740,7 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
             _check_margin(cfg, state, position, sig.ctx.mark_px, now)
 
     free_slots = cfg.max_positions - len(state.open_positions)
-    candidates: list[tuple[float, SymbolSpec, Any]] = []
+    candidates: list[tuple[float, SymbolSpec, Any, float]] = []
     for spec in cfg.universe:
         if spec.symbol in state.open_positions:
             continue
@@ -660,14 +749,22 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
         if sig.ema_apr is None or sig.ctx is None:
             decisions[spec.symbol] = "skip_no_signal"
         elif sig.ema_apr > cfg.enter_apr and gate_ok:
-            candidates.append((sig.ema_apr, spec, sig.ctx))
+            # Compute notional now (not inside _open_position): the
+            # MIN_ENTRY_NOTIONAL floor has to reject a thin-liquidity
+            # candidate BEFORE ranking/slotting it, not after opening a
+            # position too small for fees to ever be worth it.
+            notional = _entry_notional(cfg, state, spec, now)
+            if notional < MIN_ENTRY_NOTIONAL:
+                decisions[spec.symbol] = "skip_below_min_notional"
+            else:
+                candidates.append((sig.ema_apr, spec, sig.ctx, notional))
         else:
             decisions[spec.symbol] = "skip_below_threshold"
     candidates.sort(key=lambda c: c[0], reverse=True)
-    for ema_apr, spec, ctx in candidates[:free_slots] if free_slots > 0 else []:
-        _open_position(cfg, state, spec, ctx, hl_client, binance_client, ema_apr, now)
+    for ema_apr, spec, ctx, notional in candidates[:free_slots] if free_slots > 0 else []:
+        _open_position(cfg, state, spec, ctx, hl_client, binance_client, ema_apr, notional, now)
         decisions[spec.symbol] = "enter"
-    for _, spec, _ in candidates[free_slots:] if free_slots > 0 else candidates:
+    for _, spec, _, _ in candidates[free_slots:] if free_slots > 0 else candidates:
         decisions.setdefault(spec.symbol, "skip_no_slot")
 
     for spec in cfg.universe:

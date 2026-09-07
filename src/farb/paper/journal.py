@@ -33,6 +33,8 @@ POSITION_OPENED = "position_opened"
 FUNDING_ACCRUED = "funding_accrued"
 POSITION_CLOSED = "position_closed"
 LIQUIDATION = "liquidation"
+HL_MARK_REFRESHED = "hl_mark_refreshed"
+HEDGE_MARK_REFRESHED = "hedge_mark_refreshed"
 WARNING = "warning"
 
 LEG_HL = "hl"
@@ -215,10 +217,20 @@ def _apply_position_closed(state: PaperState, payload: dict[str, Any]) -> None:
     state.realized_totals["net"] += closed.net
 
 
+def _apply_hl_mark_refreshed(state: PaperState, payload: dict[str, Any]) -> None:
+    state.last_marks.setdefault(payload["symbol"], {})["hl_mark_px"] = payload["hl_mark_px"]
+
+
+def _apply_hedge_mark_refreshed(state: PaperState, payload: dict[str, Any]) -> None:
+    state.last_marks.setdefault(payload["symbol"], {})["hedge_price"] = payload["hedge_price"]
+
+
 _APPLIERS = {
     POSITION_OPENED: _apply_position_opened,
     FUNDING_ACCRUED: _apply_funding_accrued,
     POSITION_CLOSED: _apply_position_closed,
+    HL_MARK_REFRESHED: _apply_hl_mark_refreshed,
+    HEDGE_MARK_REFRESHED: _apply_hedge_mark_refreshed,
 }
 
 
@@ -269,6 +281,8 @@ def replay(path: Path) -> PaperState:
 
 __all__ = [
     "FUNDING_ACCRUED",
+    "HEDGE_MARK_REFRESHED",
+    "HL_MARK_REFRESHED",
     "LEG_HEDGE",
     "LEG_HL",
     "LIQUIDATION",

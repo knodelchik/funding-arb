@@ -1911,3 +1911,36 @@ def test_binance_series_is_stale_uses_the_events_own_interval_not_a_fixed_8h() -
         (as_of - timedelta(hours=7), 0.0002),
     ]
     assert engine._binance_series_is_stale(fresh_series, as_of) is False
+
+
+def test_last_gate_scan_tolerates_pre_spread_gate_journal_entries(tmp_path: Path) -> None:
+    """The live journal carries a month of SIGNAL_SNAPSHOT events written
+    before the spread-gate deploy — no "gate" key. The last-gate scan must
+    treat them as unknown, not crash (live incident 2026-09-30 09:10 UTC:
+    KeyError 'gate' took the production tick down)."""
+    import json as _json
+
+    from farb.paper import journal as pj
+    from farb.paper.engine import _last_binance_gate_by_symbol
+    from farb.paper.models import PaperConfig
+
+    cfg = PaperConfig(universe=[], journal_dir=tmp_path)
+    old_event = {
+        "ts": "2026-09-01T00:10:00+00:00",
+        "type": pj.SIGNAL_SNAPSHOT,
+        "payload": {"symbol": "PUMPUSDT", "ema_apr": 0.12, "decision": "hold"},
+    }
+    new_event = {
+        "ts": "2026-09-30T10:10:00+00:00",
+        "type": pj.SIGNAL_SNAPSHOT,
+        "payload": {"symbol": "UNIUSDT", "ema_apr": 0.11, "decision": "hold", "gate": "absolute"},
+    }
+    path = pj.journal_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        f.write(_json.dumps(old_event) + "\n")
+        f.write(_json.dumps(new_event) + "\n")
+
+    last = _last_binance_gate_by_symbol(cfg)
+    assert "PUMPUSDT" not in last  # unknown, not a crash
+    assert last["UNIUSDT"] == "absolute"

@@ -445,7 +445,12 @@ def _last_binance_gate_by_symbol(cfg: PaperConfig) -> dict[str, str]:
                 continue
             event = json.loads(line)
             if event["type"] == journal.SIGNAL_SNAPSHOT:
-                last[event["payload"]["symbol"]] = event["payload"]["gate"]
+                # Pre-spread-gate journal entries (before 2026-09-30) have no
+                # "gate" key; treat them as unknown rather than crashing —
+                # the live journal carries a month of them.
+                gate = event["payload"].get("gate")
+                if gate is not None:
+                    last[event["payload"]["symbol"]] = gate
     return last
 
 

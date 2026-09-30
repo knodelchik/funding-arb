@@ -22,6 +22,7 @@ edit must never be able to strand an open position with no way to unwind.
 
 from __future__ import annotations
 
+import json
 import statistics
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -78,10 +79,58 @@ LIQUIDITY_WINDOW_HOURS = 4
 # funding edge over a typical holding period — not worth opening at all.
 MIN_ENTRY_NOTIONAL = 2_000.0
 
+# Binance's own funding intervals vary by symbol/regime (1h/2h/4h/8h --
+# verified live: HYPEUSDT and PUMPUSDT both settle every 4h, not 8h) and
+# are never wider than 8h. When no parquet warmup exists at all for the
+# spread signal, the live top-up's cold-start lookback conservatively
+# ASSUMES the widest (8h) interval throughout purely to size how far back
+# to ask for `ema_periods` settlements' worth of calendar time -- this
+# assumption is used ONLY for that lookback size, never for the actual
+# per-event interval/annualization math in `_spread_signal`, which always
+# derives each event's real interval from its own gap to the previous one.
+# BN_WARMUP_MARGIN_HOURS is a flat extra-hours buffer on top of that,
+# mirroring WARMUP_MARGIN_HOURS's role for the HL leg's own series.
+BN_WARMUP_MARGIN_HOURS = 24
+
+# A newest-PIT-Binance-event age (relative to the tick hour) beyond this
+# many multiples of that event's OWN settlement interval means the data is
+# stale, not merely "the live top-up happened to fail this tick" -- see
+# `_binance_series_is_stale`.
+BN_STALENESS_INTERVAL_MULTIPLE = 2
+
+# Journaled right alongside POSITION_OPENED (see `_open_position`'s
+# docstring for why it can't be merged into that event's own payload) --
+# an event type journal.py doesn't know about, so `journal.replay` just
+# skips it as inert audit trail, same as SIGNAL_SNAPSHOT.
+POSITION_OPENED_SIGNAL = "position_opened_signal"
+
 
 @dataclass
 class _Signal:
-    ema_apr: float | None
+    """`decision_apr` is whichever of `hl_apr`/`spread_apr` is actually
+    compared against cfg.enter_apr this tick for a NEW entry (see `gate`);
+    it can be None (a perp hedge's spread hasn't got `ema_periods` settled
+    pairs yet) even when `hl_apr` isn't, in which case entries stay
+    blocked but an OPEN position's own exit decision separately falls back
+    to `hl_apr` (see `_tick`'s exit loop) so it never goes unsignalable.
+
+    `hl_apr` is always the EMA APR of the HL leg's own absolute funding
+    (spot's decision value; a perp-hedge symbol's fallback when Binance
+    data is unavailable/stale, and its exit-only fallback when Binance
+    data is on hand but not yet warmed up). `bn_apr`/`spread_apr` are
+    populated only for a perp-hedge symbol with usable (fresh, non-stale)
+    Binance funding data on hand — the EMA APR of Binance's own
+    settlement rate, and of the HL-vs-Binance spread, respectively, both
+    interval-aware and computed on the Binance settlement grid (see
+    `_spread_signal`; they run on a different grid/horizon than `hl_apr`,
+    so no `hl_apr - bn_apr == spread_apr` identity is expected).
+    """
+
+    decision_apr: float | None
+    hl_apr: float | None
+    bn_apr: float | None
+    spread_apr: float | None
+    gate: str  # "spread" | "absolute" — what decision_apr actually is, for the journal
     next_hour_funding: float | None
     hourly: list[tuple[datetime, float]]
     ctx: Any | None  # AssetCtx, kept loose to avoid a runtime farb.hl import
@@ -203,6 +252,203 @@ def _hourly_funding_series(
     return sorted(merged.items())
 
 
+def _binance_funding_parquet_path(cfg: PaperConfig, symbol: str) -> Any:
+    return cfg.data_root / "binance" / "funding" / f"{symbol}.parquet"
+
+
+def _binance_funding_series(
+    symbol: str, binance_client: Any, cfg: PaperConfig, now: datetime, ema_periods: int
+) -> list[tuple[datetime, float]]:
+    """Merge a (possibly stale) parquet warmup with a live top-up fetch into
+    a PIT Binance funding-rate series for the perp-hedge spread signal --
+    settlement INTERVAL may vary by symbol (1h/2h/4h/8h); this function
+    only collects the raw (time, rate) series, it never assumes a fixed
+    spacing (see `_spread_signal`, which derives each event's own interval
+    from its gap to the previous one).
+
+    Never raises: a missing/unreadable parquet or a live-fetch failure
+    degrades to whatever source remains (logged as a warning), not fatal —
+    an empty result (no parquet, no live data either) is one of the two
+    "Binance data unavailable" cases the caller falls back to the
+    absolute-HL gate on (the other being `_binance_series_is_stale`).
+    """
+    from farb.data.client import FAPI_BASE
+
+    merged: dict[datetime, float] = {}
+    parquet_path = _binance_funding_parquet_path(cfg, symbol)
+    if parquet_path.exists():
+        try:
+            df = pl.read_parquet(parquet_path)
+            times = df["funding_time"].to_list()
+            rates = df["funding_rate"].to_list()
+            for t, r in zip(times, rates, strict=True):
+                merged[t] = r
+        except Exception as exc:  # noqa: BLE001 - a bad parquet must degrade, not crash
+            journal.append_event(
+                cfg, journal.WARNING,
+                {"symbol": symbol, "message": f"Binance funding parquet unreadable: {exc}"},
+                now,
+            )
+
+    # Cursor forward from the last known event when we have one (mirrors
+    # _accrue_hedge_perp's cursoring); otherwise pull enough whole 8h
+    # periods of history to warm the EMA from a cold start.
+    if merged:
+        start_ms = round((max(merged) + timedelta(milliseconds=1)).timestamp() * 1000)
+    else:
+        # Cold start: no cursor to resume from, so size the lookback off
+        # the worst-case (widest, 8h) interval assumption -- see
+        # BN_WARMUP_MARGIN_HOURS's docstring above. A symbol whose real
+        # interval is narrower (e.g. 4h) just gets more history than the
+        # strict minimum, never less.
+        lookback_hours = ema_periods * ROLLING_WINDOW_HOURS + BN_WARMUP_MARGIN_HOURS
+        start_ms = round((now - timedelta(hours=lookback_hours)).timestamp() * 1000)
+    try:
+        rows = binance_client.get_list(
+            FAPI_BASE, "/fapi/v1/fundingRate",
+            {"symbol": symbol, "startTime": start_ms, "limit": 1000},
+        )
+        for row in rows:
+            t = datetime.fromtimestamp(int(row["fundingTime"]) / 1000, tz=UTC)
+            merged[t] = float(row["fundingRate"])  # live is authoritative on conflict
+    except Exception as exc:  # noqa: BLE001 - farb.data is another lane; never let it crash a tick
+        journal.append_event(
+            cfg, journal.WARNING,
+            {"symbol": symbol, "message": f"Binance fundingRate fetch failed: {exc}"},
+            now,
+        )
+
+    return sorted(merged.items())
+
+
+def _spread_signal(
+    hl_hourly: list[tuple[datetime, float]],
+    binance_series: list[tuple[datetime, float]],
+    as_of: datetime,
+    ema_periods: int,
+) -> tuple[float | None, float | None]:
+    """(bn_apr, spread_apr): PIT EMA(ema_periods) of Binance's own
+    ANNUALIZED settlement rate, and of the ANNUALIZED (HL funding over that
+    same window MINUS that rate) — computed on the BINANCE SETTLEMENT GRID,
+    INTERVAL-AWARE: Binance's own settlement interval is not fixed at 8h
+    (verified live: HYPEUSDT/PUMPUSDT both settle every 4h) and can even
+    switch mid-series (a funding-interval regime change). Treating it as a
+    fixed 8h window regardless of the REAL gap mis-pairs a narrower-interval
+    Binance rate against a too-wide HL sum and roughly HALVES the effective
+    spread APR at a 4h interval — silently letting the bot enter/hold
+    exactly what this gate exists to block.
+
+    For each settled Binance event, its own interval is the gap to the
+    PREVIOUS settled event (falling back to ROLLING_WINDOW_HOURS=8 hours
+    for the very first event, where there is no prior settlement to measure
+    from). It pairs with the HL hourly rates covering exactly
+    (previous_settlement, this_settlement] — not a fixed trailing-8h
+    window — summed and compared against the Binance rate over that SAME
+    window, then annualized by (HOURS_PER_YEAR / that event's own interval)
+    — a 4h event is annualized twice as aggressively as an 8h one, exactly
+    as it should be. Each per-event value is annualized BEFORE the EMA
+    runs over the sequence (not after, unlike `signal_apr`), since
+    different events in the same series can carry different annualization
+    factors.
+
+    None, None if there aren't yet `ema_periods` settlements with full HL
+    coverage of their own window. PIT by construction: a Binance event
+    at/after `as_of` is dropped before anything else touches it.
+
+    `hl_apr` (the hourly-grid EMA from `signal_apr`, used elsewhere for
+    audit and as the absolute-HL fallback) and this function's `bn_apr` run
+    on entirely different grids and horizons (hourly-EMA vs
+    settlement-EMA, fixed vs per-event annualization) — the journaled
+    `hl_apr - bn_apr == spread_apr` identity a prior version of this
+    docstring claimed is NOT expected to hold, even approximately.
+    """
+    pit_bn = sorted((t, r) for t, r in binance_series if t < as_of)
+    if not pit_bn:
+        return None, None
+    hl_sorted = sorted(hl_hourly)
+
+    bn_annualized: list[float] = []
+    spread_annualized: list[float] = []
+    prev_settlement: datetime | None = None
+    for settlement_t, bn_rate in pit_bn:
+        if prev_settlement is None:
+            interval_hours = float(ROLLING_WINDOW_HOURS)  # no prior settlement to measure from
+            window_start = settlement_t - timedelta(hours=interval_hours)
+        else:
+            interval_hours = (settlement_t - prev_settlement).total_seconds() / 3600
+            window_start = prev_settlement
+        prev_settlement = settlement_t
+        if interval_hours <= 0:
+            continue  # malformed/duplicate settlement timestamps -- never divide by zero
+        window = [r for t, r in hl_sorted if window_start < t <= settlement_t]
+        if len(window) < round(interval_hours):
+            continue  # not enough HL hourly coverage over this event's own window yet
+        hl_sum = sum(window)
+        periods_per_year = HOURS_PER_YEAR / interval_hours
+        bn_annualized.append(bn_rate * periods_per_year)
+        spread_annualized.append((hl_sum - bn_rate) * periods_per_year)
+
+    if len(spread_annualized) < ema_periods:
+        return None, None
+
+    def _ema(values: list[float]) -> float:
+        alpha = 2.0 / (ema_periods + 1)
+        ema = values[0]
+        for value in values[1:]:
+            ema = alpha * value + (1 - alpha) * ema
+        return ema
+
+    return _ema(bn_annualized), _ema(spread_annualized)
+
+
+def _binance_series_is_stale(bn_series: list[tuple[datetime, float]], as_of: datetime) -> bool:
+    """True when the newest PIT-eligible Binance event is old enough
+    (more than BN_STALENESS_INTERVAL_MULTIPLE x its own settlement
+    interval before `as_of`) that building a spread signal from it would
+    be silently trusting stale data just because the live top-up happened
+    to fail this tick — e.g. monthy-old parquet rows left over after a
+    live outage. The caller treats this exactly like "no Binance data at
+    all": fall back to the absolute-HL gate, never build a spread EMA from
+    it.
+    """
+    pit = sorted((t, r) for t, r in bn_series if t < as_of)
+    if not pit:
+        return True  # caught separately by the caller's own empty-series check too
+    newest_t, _ = pit[-1]
+    if len(pit) >= 2:
+        interval_hours = (pit[-1][0] - pit[-2][0]).total_seconds() / 3600
+    else:
+        interval_hours = float(ROLLING_WINDOW_HOURS)  # no prior settlement to measure from
+    if interval_hours <= 0:
+        interval_hours = float(ROLLING_WINDOW_HOURS)
+    age_hours = (as_of - newest_t).total_seconds() / 3600
+    return age_hours > BN_STALENESS_INTERVAL_MULTIPLE * interval_hours
+
+
+def _last_binance_gate_by_symbol(cfg: PaperConfig) -> dict[str, str]:
+    """The most recent SIGNAL_SNAPSHOT `gate` value per symbol, read
+    directly from the journal file (PaperState/`journal.replay` doesn't
+    reconstruct SIGNAL_SNAPSHOT history — it's audit-trail-only, see
+    journal.py's own docstring) — used ONLY to tell a NEW Binance-data
+    outage (last tick's gate for this symbol was "spread") from an ONGOING
+    one (already "absolute"), so the fallback warning fires once per
+    outage rather than every tick it persists.
+    """
+    path = journal.journal_path(cfg)
+    if not path.exists():
+        return {}
+    last: dict[str, str] = {}
+    with path.open() as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            event = json.loads(line)
+            if event["type"] == journal.SIGNAL_SNAPSHOT:
+                last[event["payload"]["symbol"]] = event["payload"]["gate"]
+    return last
+
+
 def _binance_bookticker(binance_client: Any, symbol: str, hedge_mode: HedgeMode) -> dict[str, Any]:
     from farb.data.client import FAPI_BASE, SPOT_BASE
 
@@ -322,14 +568,25 @@ def _open_position(
     ctx: Any,
     hl_client: Any,
     binance_client: Any,
-    ema_apr: float,
+    decision_apr: float,
+    gate: str,
     notional: float,
     now: datetime,
 ) -> None:
     """`notional` is precomputed by the caller (via `_entry_notional`) at
     candidate-filtering time, not here — the MIN_ENTRY_NOTIONAL floor has
     to reject a candidate BEFORE it's ranked/slotted, not after opening a
-    tiny position.
+    tiny position. `decision_apr`/`gate` are whichever signal (absolute-HL
+    or spread) actually triggered the entry, per `_Signal.gate` — the
+    Position model already carries `signal_apr_at_entry` (decision_apr),
+    but not which GATE it came from. `gate` is NOT merged into the
+    POSITION_OPENED payload itself: journal.py's `_apply_position_opened`
+    parses that payload straight through `Position.model_validate` (the
+    Position model has `extra="forbid"`, off-limits here), so any extra
+    key there would break every future replay. It's journaled as its own
+    POSITION_OPENED_SIGNAL event instead, right alongside, at the same
+    timestamp — an audit-trail-only event type `journal.replay` safely
+    ignores (same as SIGNAL_SNAPSHOT), so this needs no journal.py change.
     """
     hl_book = hl_client.book_top(spec.hl_coin)
     hedge_price = _binance_book_price(binance_client, spec.symbol, spec.hedge_mode, side="ask")
@@ -346,11 +603,16 @@ def _open_position(
         entry_fills=fills,
         funding_received_usd=0.0,
         funding_paid_usd=0.0,
-        signal_apr_at_entry=ema_apr,
+        signal_apr_at_entry=decision_apr,
     )
     state.open_positions[spec.symbol] = position
     state.last_marks[spec.symbol] = {"hl_mark_px": hl_fill.price, "hedge_price": hedge_fill.price}
     journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), now)
+    journal.append_event(
+        cfg, POSITION_OPENED_SIGNAL,
+        {"symbol": spec.symbol, "entry_gate": gate, "entry_decision_apr": decision_apr},
+        now,
+    )
 
 
 def _finalize_close(
@@ -361,10 +623,17 @@ def _finalize_close(
     now: datetime,
     *,
     liquidated: bool,
+    exit_gate: str | None = None,
+    exit_decision_apr: float | None = None,
 ) -> None:
     """Shared decomposition + journal-write for both a normal close and a
     liquidation — they differ only in how `fills` were obtained and the
     `liquidated` flag, not in how the resulting PnL is computed or logged.
+
+    `exit_gate`/`exit_decision_apr` (None for a liquidation, which isn't
+    signal-driven) record which gate and APR actually triggered a
+    signal-driven close, for auditability -- extends the JOURNAL payload
+    only, journal.py's `ClosedPosition`/schema is untouched.
     """
     hl_exit, hedge_exit = fills
     entry_hl = next(f for f in position.entry_fills if f.leg == "hl_short")
@@ -397,6 +666,8 @@ def _finalize_close(
             "net": net,
             "exit_fills": [f.model_dump(mode="json") for f in fills],
             "liquidated": liquidated,
+            "exit_gate": exit_gate,
+            "exit_decision_apr": exit_decision_apr,
         },
         now,
     )
@@ -427,13 +698,19 @@ def _close_position(
     hl_client: Any,
     binance_client: Any,
     now: datetime,
+    *,
+    exit_gate: str | None = None,
+    exit_decision_apr: float | None = None,
 ) -> None:
     hl_book = hl_client.book_top(position.hl_coin)
     hedge_price = _binance_book_price(
         binance_client, position.symbol, position.hedge_mode, side="bid"
     )
     fills = broker.close_pair(position, hl_book, hedge_price, now, cfg)
-    _finalize_close(cfg, state, position, fills, now, liquidated=False)
+    _finalize_close(
+        cfg, state, position, fills, now, liquidated=False,
+        exit_gate=exit_gate, exit_decision_apr=exit_decision_apr,
+    )
 
 
 def _liq_price(position: Position, cfg: PaperConfig) -> float:
@@ -680,13 +957,69 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
     hl_coin_by_symbol: dict[str, str] = {s.symbol: s.hl_coin for s in cfg.universe}
     for symbol, position in state.open_positions.items():
         hl_coin_by_symbol.setdefault(symbol, position.hl_coin)
+    # Same union-with-open-positions logic for hedge_mode, but an OPEN
+    # position's own hedge_mode (frozen at entry) ALWAYS wins over the
+    # config's, even when the symbol is STILL in cfg.universe -- unlike
+    # hl_coin above, hedge_mode can be edited in place for an existing
+    # universe entry (a config flip PERP->SPOT), and re-gating an already
+    # -open perp position onto the absolute-HL signal just because the
+    # config now says SPOT would silently stop accounting for the Binance
+    # funding it's actually still paying away.
+    hedge_mode_by_symbol: dict[str, HedgeMode] = {s.symbol: s.hedge_mode for s in cfg.universe}
+    for symbol, position in state.open_positions.items():
+        hedge_mode_by_symbol[symbol] = position.hedge_mode
+
+    # Only consulted for PERP symbols' fallback-warning dedup below; a full
+    # extra journal scan, but a cheap one relative to `journal.replay`'s
+    # own full pass moments ago, and SIGNAL_SNAPSHOT history isn't
+    # reconstructed by replay() at all (see its own docstring).
+    last_gate_by_symbol = _last_binance_gate_by_symbol(cfg)
 
     signals: dict[str, _Signal] = {}
     for symbol, hl_coin in hl_coin_by_symbol.items():
         hourly = _hourly_funding_series(symbol, hl_coin, hl_client, state, cfg, hour, now)
         ctx = asset_ctxs.get(hl_coin)
+        hl_apr = signal_apr(hourly, hour, cfg.ema_periods)
+
+        # SPOT hedges keep the absolute-HL gate untouched. PERP hedges gate
+        # on the HL-vs-Binance SPREAD instead (a perp hedge pays away its
+        # own Binance funding, so gating on HL alone overstates the edge
+        # whenever Binance funding is also rich) — unless Binance data for
+        # this symbol is unavailable (missing) or too old to trust (stale:
+        # e.g. a live outage left only month-old parquet rows), in which
+        # case this degrades to the same absolute-HL gate SPOT uses, never
+        # a crash or a silent zero. The fallback warning fires once per
+        # OUTAGE (a transition into "absolute"), not every tick it persists.
+        bn_apr: float | None = None
+        spread_apr: float | None = None
+        if hedge_mode_by_symbol[symbol] == HedgeMode.PERP:
+            bn_series = _binance_funding_series(symbol, binance_client, cfg, now, cfg.ema_periods)
+            stale = bool(bn_series) and _binance_series_is_stale(bn_series, hour)
+            if bn_series and not stale:
+                bn_apr, spread_apr = _spread_signal(hourly, bn_series, hour, cfg.ema_periods)
+                decision_apr, gate = spread_apr, "spread"
+            else:
+                if last_gate_by_symbol.get(symbol) != "absolute":
+                    reason = "too stale to trust" if stale else "unavailable"
+                    journal.append_event(
+                        cfg, journal.WARNING,
+                        {
+                            "symbol": symbol,
+                            "message": f"Binance funding data {reason} for the spread signal; "
+                            "falling back to the absolute-HL gate",
+                        },
+                        now,
+                    )
+                decision_apr, gate = hl_apr, "absolute"
+        else:
+            decision_apr, gate = hl_apr, "absolute"
+
         signals[symbol] = _Signal(
-            ema_apr=signal_apr(hourly, hour, cfg.ema_periods),
+            decision_apr=decision_apr,
+            hl_apr=hl_apr,
+            bn_apr=bn_apr,
+            spread_apr=spread_apr,
+            gate=gate,
             next_hour_funding=ctx.funding_hourly if ctx is not None else None,
             hourly=hourly,
             ctx=ctx,
@@ -715,11 +1048,25 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
             decisions[symbol] = "liquidated"
             continue
 
+        # An OPEN position must never become unsignalable for EXIT purposes:
+        # if the primary decision_apr is unavailable this tick (a perp
+        # hedge's spread hasn't got `ema_periods` settled pairs yet, or the
+        # tick fell back to "absolute" already) but the absolute-HL EMA
+        # itself IS available, exits fall back to that -- entries are a
+        # SEPARATE, unmutated read of `sig.decision_apr` below and stay
+        # blocked in this same condition, exactly as before.
+        exit_apr, exit_gate = (sig.decision_apr, sig.gate) if sig is not None else (None, None)
+        if exit_apr is None and sig is not None and sig.hl_apr is not None:
+            exit_apr, exit_gate = sig.hl_apr, "absolute"
+
         left_universe = spec is None
-        signal_exit = sig is not None and sig.ema_apr is not None and sig.ema_apr < cfg.exit_apr
+        signal_exit = exit_apr is not None and exit_apr < cfg.exit_apr
         should_exit = left_universe or signal_exit
         if should_exit and can_price:
-            _close_position(cfg, state, position, hl_client, binance_client, now)
+            _close_position(
+                cfg, state, position, hl_client, binance_client, now,
+                exit_gate=exit_gate, exit_decision_apr=exit_apr,
+            )
             decisions[symbol] = "exit"
         elif should_exit:
             journal.append_event(
@@ -740,15 +1087,15 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
             _check_margin(cfg, state, position, sig.ctx.mark_px, now)
 
     free_slots = cfg.max_positions - len(state.open_positions)
-    candidates: list[tuple[float, SymbolSpec, Any, float]] = []
+    candidates: list[tuple[float, SymbolSpec, Any, float, str]] = []
     for spec in cfg.universe:
         if spec.symbol in state.open_positions:
             continue
         sig = signals[spec.symbol]
         gate_ok = sig.next_hour_funding is not None and sig.next_hour_funding > 0
-        if sig.ema_apr is None or sig.ctx is None:
+        if sig.decision_apr is None or sig.ctx is None:
             decisions[spec.symbol] = "skip_no_signal"
-        elif sig.ema_apr > cfg.enter_apr and gate_ok:
+        elif sig.decision_apr > cfg.enter_apr and gate_ok:
             # Compute notional now (not inside _open_position): the
             # MIN_ENTRY_NOTIONAL floor has to reject a thin-liquidity
             # candidate BEFORE ranking/slotting it, not after opening a
@@ -757,14 +1104,18 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
             if notional < MIN_ENTRY_NOTIONAL:
                 decisions[spec.symbol] = "skip_below_min_notional"
             else:
-                candidates.append((sig.ema_apr, spec, sig.ctx, notional))
+                candidates.append((sig.decision_apr, spec, sig.ctx, notional, sig.gate))
         else:
             decisions[spec.symbol] = "skip_below_threshold"
     candidates.sort(key=lambda c: c[0], reverse=True)
-    for ema_apr, spec, ctx, notional in candidates[:free_slots] if free_slots > 0 else []:
-        _open_position(cfg, state, spec, ctx, hl_client, binance_client, ema_apr, notional, now)
+    for decision_apr, spec, ctx, notional, gate in (
+        candidates[:free_slots] if free_slots > 0 else []
+    ):
+        _open_position(
+            cfg, state, spec, ctx, hl_client, binance_client, decision_apr, gate, notional, now
+        )
         decisions[spec.symbol] = "enter"
-    for _, spec, _, _ in candidates[free_slots:] if free_slots > 0 else candidates:
+    for _, spec, _, _, _ in candidates[free_slots:] if free_slots > 0 else candidates:
         decisions.setdefault(spec.symbol, "skip_no_slot")
 
     for spec in cfg.universe:
@@ -773,7 +1124,11 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
             cfg, journal.SIGNAL_SNAPSHOT,
             {
                 "symbol": spec.symbol,
-                "ema_apr": sig.ema_apr,
+                "ema_apr": sig.decision_apr,
+                "hl_apr": sig.hl_apr,
+                "bn_apr": sig.bn_apr,
+                "spread_apr": sig.spread_apr,
+                "gate": sig.gate,
                 "next_hour_funding": sig.next_hour_funding,
                 "decision": decisions.get(spec.symbol, "hold"),
             },

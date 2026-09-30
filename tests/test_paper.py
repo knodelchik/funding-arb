@@ -20,7 +20,7 @@ import pytest
 
 from farb.paper import broker, engine, journal, report
 from farb.paper.models import Fill, HedgeMode, PaperConfig, Position, SymbolSpec
-from farb.schemas import KLINE_SCHEMA
+from farb.schemas import FUNDING_SCHEMA, KLINE_SCHEMA
 
 T0 = datetime(2025, 6, 1, tzinfo=UTC)
 
@@ -79,11 +79,14 @@ class FakeHLClient:
 class FakeBinanceClient:
     book_tickers: dict[str, dict[str, str]] = field(default_factory=dict)
     funding_rows: dict[str, list[dict]] = field(default_factory=dict)
+    raise_on_get_list: bool = False
 
     def get(self, base: str, path: str, params: dict) -> dict:
         return self.book_tickers[params["symbol"]]
 
     def get_list(self, base: str, path: str, params: dict) -> list[dict]:
+        if self.raise_on_get_list:
+            raise RuntimeError("simulated Binance outage")
         rows = self.funding_rows.get(params["symbol"], [])
         start_ms = params.get("startTime", 0)
         return [r for r in rows if int(r["fundingTime"]) >= start_ms]
@@ -1244,3 +1247,667 @@ def test_refresh_hedge_mark_carries_previous_on_fetch_failure(tmp_path: Path) ->
     warnings = [e for e in events if e["type"] == journal.WARNING]
     assert len(warnings) == 1
     assert "hedge mark fetch failed" in warnings[0]["payload"]["message"]
+
+
+# --------------------------------------------------------------------------
+# 15. Perp-hedge spread gate: a perp hedge PAYS AWAY its own Binance
+#     funding, so gating entry/exit on absolute HL funding alone overstates
+#     the edge whenever Binance funding is also rich. For hedge_mode=PERP
+#     symbols only, the gate becomes the HL-vs-Binance SPREAD; spot hedges
+#     (which pay no funding) are unaffected.
+# --------------------------------------------------------------------------
+
+
+def _signal_snapshot(cfg: PaperConfig, symbol: str) -> dict:
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    return next(
+        e["payload"] for e in events
+        if e["type"] == journal.SIGNAL_SNAPSHOT and e["payload"]["symbol"] == symbol
+    )
+
+
+def test_perp_hedge_spread_gate_blocks_entry_when_binance_funding_matches_hl(
+    tmp_path: Path,
+) -> None:
+    """Perp-hedge candidate: HL funding is high AND Binance funding is
+    EQUALLY high (spread ~ 0) -> must NOT enter, even though the D-gate
+    and the absolute-HL EMA are both well above cfg.enter_apr. A mutant
+    that reverts a PERP symbol's gate back to the absolute-HL EMA (ignoring
+    Binance funding entirely) enters here and fails this.
+    """
+    cfg = _make_cfg(tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, ema_periods=2)
+    hour0 = journal.hour_bucket(T0)
+    # 16 hourly HL points covering both 8h windows ending at the two
+    # Binance settlements below (hour0-16h and hour0-8h).
+    hl_rates = _hourly_rates(hour0 - timedelta(hours=23), [0.0002] * 16, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0002, mark_px=100.0)},
+        funding={"FOO": hl_rates},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    bn_rows = [
+        {"fundingTime": round((hour0 - timedelta(hours=16)).timestamp() * 1000),
+         "fundingRate": "0.0016", "markPrice": "100.0"},
+        {"fundingTime": round((hour0 - timedelta(hours=8)).timestamp() * 1000),
+         "fundingRate": "0.0016", "markPrice": "100.0"},
+    ]
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        funding_rows={"FOOUSDT": bn_rows},
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions
+
+    snapshot = _signal_snapshot(cfg, "FOOUSDT")
+    assert snapshot["gate"] == "spread"
+    assert snapshot["spread_apr"] == pytest.approx(0.0, abs=1e-9)
+    assert snapshot["hl_apr"] is not None and snapshot["hl_apr"] > cfg.enter_apr
+    assert snapshot["decision"] == "skip_below_threshold"
+
+
+def test_spot_hedge_keeps_absolute_gate_same_construction_enters(tmp_path: Path) -> None:
+    """Identical construction to the spread-gate block above, but
+    hedge_mode=SPOT: spot hedges keep the absolute-HL gate untouched (spot
+    pays no funding, so there is no Binance-funding leakage to gate on) --
+    must enter on the (unchanged) high absolute-HL EMA, ignoring the
+    equally-high Binance funding entirely. A mutant that applies the
+    spread gate uniformly regardless of hedge_mode fails this (spread ~ 0
+    would block entry here too).
+    """
+    cfg = _make_cfg(tmp_path, universe=[SPOT_SPEC], maker_fill_prob=1.0, ema_periods=2)
+    hour0 = journal.hour_bucket(T0)
+    hl_rates = _hourly_rates(hour0 - timedelta(hours=23), [0.0002] * 16, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0002, mark_px=100.0)},
+        funding={"FOO": hl_rates},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    bn_rows = [
+        {"fundingTime": round((hour0 - timedelta(hours=16)).timestamp() * 1000),
+         "fundingRate": "0.0016", "markPrice": "100.0"},
+        {"fundingTime": round((hour0 - timedelta(hours=8)).timestamp() * 1000),
+         "fundingRate": "0.0016", "markPrice": "100.0"},
+    ]
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        funding_rows={"FOOUSDT": bn_rows},  # present but must be ignored for a spot hedge
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions
+
+    snapshot = _signal_snapshot(cfg, "FOOUSDT")
+    assert snapshot["gate"] == "absolute"
+    assert snapshot["bn_apr"] is None
+    assert snapshot["spread_apr"] is None
+
+
+def test_perp_hedge_spread_gate_exits_when_binance_funding_rises_to_match(tmp_path: Path) -> None:
+    """Open a perp-hedge position on a genuinely wide spread (HL rich,
+    Binance cheap), then let Binance funding rise to match HL (spread
+    collapses to ~0, below exit_apr) while HL funding itself STAYS high --
+    must exit. The absolute-gate mutant (HL alone still reads high) would
+    hold instead and fails this.
+    """
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, ema_periods=1,
+        enter_apr=0.12, exit_apr=0.005,
+    )
+    hour0 = journal.hour_bucket(T0)
+    # 16 HL hourly points, hour0-15h..hour0 inclusive, all at a constant
+    # high rate -- covers both settlement windows below (hour0-16h and
+    # hour0) and keeps HL funding "high" throughout, unchanged.
+    hl_rates = _hourly_rates(hour0 - timedelta(hours=15), [0.0003] * 16, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0003, mark_px=100.0)},
+        funding={"FOO": hl_rates},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    # Binance: cheap at entry's settlement (hour0-8h) -> wide spread, entry.
+    # Rich at the later settlement (hour0, matching HL's 8h-sum 0.0024)
+    # -> spread collapses, exit. Both rows registered up front; the PIT
+    # filter inside _spread_signal is what restricts each tick to only the
+    # settlements strictly before its own `now`.
+    bn_rows = [
+        {"fundingTime": round((hour0 - timedelta(hours=8)).timestamp() * 1000),
+         "fundingRate": "0.0004", "markPrice": "100.0"},
+        {"fundingTime": round(hour0.timestamp() * 1000),
+         "fundingRate": "0.0024", "markPrice": "100.0"},
+    ]
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        funding_rows={"FOOUSDT": bn_rows},
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions, "wide HL-vs-Binance spread must enter"
+    entry_snapshot = _signal_snapshot(cfg, "FOOUSDT")
+    assert entry_snapshot["gate"] == "spread"
+    assert entry_snapshot["spread_apr"] > cfg.enter_apr
+
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=8)
+    )
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions, (
+        "spread collapse must exit despite HL staying high"
+    )
+    assert len(state.closed) == 1
+
+
+def test_spread_signal_is_pit_event_at_tick_hour_excluded() -> None:
+    """A Binance funding event settling exactly AT the tick hour (t ==
+    as_of) must not affect that tick's decision -- only strictly-before
+    events are PIT-eligible. The extra event below is constructed so it
+    WOULD have a fully-covered 8h HL window if wrongly included (its
+    absence from the result is due to the PIT filter itself, not a
+    missing-coverage skip), and its rate is chosen to be wildly different
+    so an off-by-one (`<=` instead of `<`) changes the result unmistakably.
+    """
+    as_of = T0 + timedelta(hours=16)
+    hl_hourly = [(T0 + timedelta(hours=i), 0.0003) for i in range(17)]  # T0 .. T0+16h
+    binance_before = [(T0 + timedelta(hours=8), 0.0004)]
+
+    result_before = engine._spread_signal(hl_hourly, binance_before, as_of, ema_periods=1)
+    assert result_before != (None, None)
+
+    binance_with_at_tick_event = [*binance_before, (as_of, -999.0)]
+    result_after = engine._spread_signal(
+        hl_hourly, binance_with_at_tick_event, as_of, ema_periods=1
+    )
+
+    assert result_after == result_before
+
+
+def test_perp_hedge_falls_back_to_absolute_gate_when_binance_funding_data_missing(
+    tmp_path: Path,
+) -> None:
+    """No Binance funding data at all for the symbol (no parquet on disk,
+    live fetch returns nothing) -> falls back to the absolute-HL gate
+    (still entering on a strongly positive absolute signal) and journals
+    exactly ONE warning about it. A mutant that silently treats a missing
+    series as a zero spread (blocking entry) fails the entry assertion; one
+    that crashes on empty data fails outright; one that never warns fails
+    the warning-count assertion.
+    """
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, ema_periods=2, enter_apr=0.12
+    )
+    hour0 = journal.hour_bucket(T0)
+    warmup = _hourly_rates(hour0 - timedelta(hours=9), [0.0005] * 9, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0005, mark_px=100.0)},
+        funding={"FOO": warmup},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        # no funding_rows entry for FOOUSDT at all, and no parquet on disk.
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions, "must fall back to the absolute-HL gate and enter"
+
+    snapshot = _signal_snapshot(cfg, "FOOUSDT")
+    assert snapshot["gate"] == "absolute"
+    assert snapshot["bn_apr"] is None
+    assert snapshot["spread_apr"] is None
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    fallback_warnings = [
+        e for e in events
+        if e["type"] == journal.WARNING
+        and e["payload"]["symbol"] == "FOOUSDT"
+        and "Binance funding data" in e["payload"]["message"]
+    ]
+    assert len(fallback_warnings) == 1
+
+
+# --------------------------------------------------------------------------
+# 16. Interval-aware spread (post-review fix batch): Binance's own funding
+#     interval is NOT always 8h (verified live on HYPEUSDT/PUMPUSDT: both
+#     settle every 4h) and can switch mid-series. A fixed-8h-window
+#     assumption mis-pairs a narrower-interval Binance rate against a
+#     too-wide HL sum and roughly HALVES the effective spread APR --
+#     silently entering/holding exactly what the gate exists to block.
+# --------------------------------------------------------------------------
+
+
+def test_perp_hedge_spread_gate_handles_4h_binance_interval_no_entry_at_true_zero_spread(
+    tmp_path: Path,
+) -> None:
+    """HL and Binance funding are both rich, in EXACT proportion to their
+    own settlement windows (true spread == 0 throughout) -- must NOT
+    enter. A fixed-8h-assuming implementation mis-pairs the second
+    (genuinely 4h-spaced) Binance rate against an (incorrectly) 8h-wide HL
+    sum, manufacturing a large nonzero spread, and enters wrongly.
+    """
+    cfg = _make_cfg(tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, ema_periods=2)
+    hour0 = journal.hour_bucket(T0)
+    # 12 contiguous HL hourly points, hour0-19h..hour0-8h, constant rate --
+    # covers both settlement windows below exactly.
+    hl_rates = _hourly_rates(hour0 - timedelta(hours=19), [0.0002] * 12, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0002, mark_px=100.0)},
+        funding={"FOO": hl_rates},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    # First Binance settlement (hour0-12h): no prior settlement, falls back
+    # to an assumed 8h interval -- its window is hour0-20h..hour0-12h (8h),
+    # HL sum 8*0.0002=0.0016, matched exactly by this rate -> zero spread.
+    t1 = hour0 - timedelta(hours=12)
+    # Second settlement, 4h later (hour0-8h): a REAL 4h interval -- its
+    # window is hour0-12h..hour0-8h (4h), HL sum 4*0.0002=0.0008, matched
+    # exactly -> zero spread. A fixed-8h-assuming implementation instead
+    # pairs this rate against an (incorrectly) 8h-wide HL sum (0.0016),
+    # manufacturing a large nonzero mismatch.
+    t2 = hour0 - timedelta(hours=8)
+    bn_rows = [
+        {"fundingTime": round(t1.timestamp() * 1000), "fundingRate": "0.0016",
+         "markPrice": "100.0"},
+        {"fundingTime": round(t2.timestamp() * 1000), "fundingRate": "0.0008",
+         "markPrice": "100.0"},
+    ]
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        funding_rows={"FOOUSDT": bn_rows},
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions
+
+    snapshot = _signal_snapshot(cfg, "FOOUSDT")
+    assert snapshot["gate"] == "spread"
+    assert snapshot["spread_apr"] == pytest.approx(0.0, abs=1e-9)
+    assert snapshot["hl_apr"] is not None and snapshot["hl_apr"] > cfg.enter_apr
+    assert snapshot["decision"] == "skip_below_threshold"
+
+
+def test_spread_signal_handles_mixed_8h_then_4h_intervals_per_event() -> None:
+    """Binance settlement intervals can switch mid-series (e.g. 8h then
+    4h) -- each event must be annualized by its OWN gap-to-previous
+    interval, not a leftover/global one. A bug that reuses the prior (8h)
+    interval for the newest (4h) event exactly HALVES its annualized
+    spread (periods_per_year is inversely proportional to interval_hours)
+    -- pinned here to a hand-computed exact value so that halving shows up
+    unmistakably.
+    """
+    hl_hourly = [(T0 + timedelta(hours=i), 0.0003) for i in range(1, 21)]  # T0+1h .. T0+20h
+    e1 = T0 + timedelta(hours=8)   # first -- falls back to an assumed 8h interval
+    e2 = T0 + timedelta(hours=16)  # 8h after e1 -- a REAL (not fallback) 8h interval
+    e3 = T0 + timedelta(hours=20)  # 4h after e2 -- switches to a REAL 4h interval
+    binance_series = [
+        (e1, 0.0024),  # matches e1's own 8h HL sum exactly -> irrelevant to the pinned value
+        (e2, 0.0024),  # matches e2's own 8h HL sum exactly -> irrelevant to the pinned value
+        (e3, 0.0011),  # e3's 4h HL sum is 0.0012 -> a deliberate, nonzero 0.0001 spread
+    ]
+    as_of = T0 + timedelta(hours=21)
+
+    _, spread_apr = engine._spread_signal(hl_hourly, binance_series, as_of, ema_periods=1)
+
+    # ema_periods=1 -> alpha=1 -> the EMA collapses to the LAST value only,
+    # isolating e3's own annualization: (0.0012 - 0.0011) * (8766/4).
+    expected = 0.0001 * (engine.HOURS_PER_YEAR / 4)
+    assert spread_apr == pytest.approx(expected)
+    # If a bug reused e2's 8h interval for e3, this would come out HALVED.
+    assert spread_apr != pytest.approx(0.0001 * (engine.HOURS_PER_YEAR / 8))
+
+
+def test_spread_signal_requires_full_ema_periods_of_valid_pairs_not_just_any() -> None:
+    """Only 2 of the 6 settlement pairs `ema_periods=6` requires exist (each
+    with full HL coverage) -> must return (None, None), not compute from
+    whatever happens to be available. A mutant that checks `not
+    <component>` (list non-empty) instead of `len(<component>) <
+    ema_periods` (enough elements) survives with only 2 pairs and must
+    fail this.
+    """
+    as_of = T0 + timedelta(hours=17)
+    hl_hourly = [(T0 + timedelta(hours=i), 0.0003) for i in range(17)]  # T0 .. T0+16h
+    e1 = T0 + timedelta(hours=8)
+    e2 = T0 + timedelta(hours=16)  # 8h after e1 -- second, fully-covered pair
+    binance_series = [(e1, 0.0024), (e2, 0.0024)]  # both fully covered, only 2 of 6
+
+    result = engine._spread_signal(hl_hourly, binance_series, as_of, ema_periods=6)
+
+    assert result == (None, None)
+
+
+def test_perp_hedge_falls_back_when_binance_data_is_stale_not_just_missing(tmp_path: Path) -> None:
+    """Fresh HL data + a Binance funding parquet whose only row is a MONTH
+    old + a failed live top-up fetch -- the parquet isn't EMPTY, so a
+    staleness-blind implementation would happily build a spread EMA from
+    month-old Binance rates just because the live fetch failed. Must
+    instead treat this as Binance-data-unavailable: gate="absolute" (still
+    entering on the absolute-HL signal), not "spread", with a fallback
+    warning.
+    """
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, ema_periods=2, enter_apr=0.12
+    )
+    hour0 = journal.hour_bucket(T0)
+    warmup = _hourly_rates(hour0 - timedelta(hours=9), [0.0005] * 9, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0005, mark_px=100.0)},
+        funding={"FOO": warmup},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    stale_time = hour0 - timedelta(days=30)
+    df = pl.DataFrame(
+        {
+            "symbol": ["FOOUSDT"],
+            "funding_time": [stale_time],
+            "funding_rate": [0.0004],
+            "mark_price": [100.0],
+        },
+        schema=FUNDING_SCHEMA,
+    )
+    path = cfg.data_root / "binance" / "funding" / "FOOUSDT.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(path)
+
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        raise_on_get_list=True,  # simulated live-fetch outage: only the stale parquet remains
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions, "must fall back to the absolute-HL gate and enter"
+
+    snapshot = _signal_snapshot(cfg, "FOOUSDT")
+    assert snapshot["gate"] == "absolute"
+    assert snapshot["spread_apr"] is None
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    fallback_warnings = [
+        e for e in events
+        if e["type"] == journal.WARNING
+        and e["payload"]["symbol"] == "FOOUSDT"
+        and "Binance funding data" in e["payload"]["message"]
+    ]
+    assert len(fallback_warnings) == 1
+
+
+def test_perp_hedge_fallback_warning_fires_once_per_outage_not_every_tick(tmp_path: Path) -> None:
+    """Binance data stays missing across TWO consecutive ticks -- the
+    fallback warning must fire once for the outage, not once per tick it
+    persists.
+    """
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, ema_periods=2, enter_apr=0.12,
+        exit_apr=0.005,
+    )
+    hour0 = journal.hour_bucket(T0)
+    warmup = _hourly_rates(hour0 - timedelta(hours=9), [0.0005] * 9, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0005, mark_px=100.0)},
+        funding={"FOO": warmup},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        # no funding_rows entry for FOOUSDT at all, and no parquet on disk,
+        # in EITHER tick below.
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=1)
+    )
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    fallback_warnings = [
+        e for e in events
+        if e["type"] == journal.WARNING
+        and e["payload"]["symbol"] == "FOOUSDT"
+        and "Binance funding data" in e["payload"]["message"]
+    ]
+    assert len(fallback_warnings) == 1
+
+
+def test_open_perp_position_exit_falls_back_to_absolute_signal_when_spread_pairs_insufficient(
+    tmp_path: Path,
+) -> None:
+    """An open perp-hedge position must never become unsignalable for exit
+    purposes: Binance data IS available and fresh, but there aren't yet
+    `ema_periods` settlement pairs with full HL coverage -- the spread
+    signal itself reads None. The exit decision must fall back to the
+    absolute-HL EMA (not silently hold forever waiting for more pairs)
+    when THAT signal is below exit_apr, and the journaled close records
+    exit_gate="absolute" for auditability.
+    """
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, ema_periods=6,
+        enter_apr=0.6, exit_apr=0.5,
+    )
+    hour0 = journal.hour_bucket(T0)
+    position = _liquidation_test_position()  # hedge_mode=PERP, entry_ts=T0
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), T0)
+
+    # HL funding is LOW (well below exit_apr=0.5 once annualized) -- the
+    # absolute-HL EMA alone must trigger the exit. 20 points so the
+    # standard hourly-grid signal_apr (needs ema_periods=6 SUMMED values,
+    # i.e. 13 raw points) is actually warmed up.
+    hl_rates = _hourly_rates(hour0 - timedelta(hours=20), [0.00001] * 20, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.00001, mark_px=100.0)},
+        funding={"FOO": hl_rates},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    # A single, fresh, valid Binance settlement -- Binance data is
+    # AVAILABLE (not missing, not stale), just short of the 6 pairs
+    # ema_periods=6 requires, so the spread signal itself reads None.
+    bn_rows = [
+        {"fundingTime": round(hour0.timestamp() * 1000), "fundingRate": "0.00008",
+         "markPrice": "100.0"},
+    ]
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"}},
+        funding_rows={"FOOUSDT": bn_rows},
+    )
+
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=1)
+    )
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions, (
+        "exit must fall back to the absolute-HL signal, not hold forever waiting on 6 pairs"
+    )
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    closed = next(e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED)
+    assert closed["exit_gate"] == "absolute"
+    assert closed["exit_decision_apr"] is not None and closed["exit_decision_apr"] < cfg.exit_apr
+
+
+def test_open_perp_position_keeps_its_own_hedge_mode_after_config_flips_to_spot(
+    tmp_path: Path,
+) -> None:
+    """A config edit flipping a symbol's hedge_mode from PERP to SPOT while
+    a PERP position is already open must NOT re-gate that open position's
+    signal onto the absolute-HL (SPOT) path -- the position's OWN
+    hedge_mode (frozen at entry) must keep governing it. Proven by a
+    spread-collapse construction where the absolute-HL signal alone would
+    read HIGH (hold) while the true spread has collapsed (exit): only the
+    correctly-PERP-gated signal exits.
+    """
+    cfg = _make_cfg(
+        tmp_path, universe=[SPOT_SPEC], maker_fill_prob=1.0, ema_periods=1,
+        enter_apr=0.12, exit_apr=0.005,
+    )
+    hour0 = journal.hour_bucket(T0)
+    position = Position(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.PERP, qty=10.0,
+        notional_entry=1000.0, entry_ts=hour0,
+        entry_fills=[
+            Fill(venue="hyperliquid", leg="hl_short", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=True, ts=hour0),
+            Fill(venue="binance", leg="hedge_long", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=False, ts=hour0),
+        ],
+        funding_received_usd=0.0, funding_paid_usd=0.0, signal_apr_at_entry=0.5,
+    )
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), hour0)
+
+    # Same "spread collapses while HL alone stays high" construction as the
+    # spread-exit test: HL rich throughout; Binance cheap at the first
+    # settlement, rich (matching HL) at the second -- true spread ~ 0.
+    hl_rates = _hourly_rates(hour0 - timedelta(hours=15), [0.0003] * 16, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0003, mark_px=100.0)},
+        funding={"FOO": hl_rates},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    bn_rows = [
+        {"fundingTime": round((hour0 - timedelta(hours=8)).timestamp() * 1000),
+         "fundingRate": "0.0004", "markPrice": "100.0"},
+        {"fundingTime": round(hour0.timestamp() * 1000),
+         "fundingRate": "0.0024", "markPrice": "100.0"},
+    ]
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        funding_rows={"FOOUSDT": bn_rows},
+    )
+
+    # cfg.universe now says SPOT for this symbol (simulating a config edit
+    # after entry) -- the position's OWN (PERP) hedge_mode must still govern.
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=8)
+    )
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions, (
+        "true spread has collapsed -- must exit using the position's own PERP hedge_mode, "
+        "not the config's (now SPOT) one"
+    )
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    closed = next(e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED)
+    assert closed["exit_gate"] == "spread"
+
+
+def test_position_opened_payload_records_entry_gate_and_decision_apr(tmp_path: Path) -> None:
+    """The entry must be fully auditable: which gate (spread vs absolute)
+    and decision APR actually triggered it. The Position model itself
+    already carries signal_apr_at_entry, but not which GATE it came from
+    -- that's journaled in a separate POSITION_OPENED_SIGNAL event right
+    alongside POSITION_OPENED (see `_open_position`'s docstring for why it
+    isn't merged into that event's own payload).
+    """
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, ema_periods=1, enter_apr=0.12
+    )
+    hour0 = journal.hour_bucket(T0)
+    hl_rates = _hourly_rates(hour0 - timedelta(hours=15), [0.0003] * 8, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0003, mark_px=100.0)},
+        funding={"FOO": hl_rates},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    bn_rows = [
+        {"fundingTime": round((hour0 - timedelta(hours=8)).timestamp() * 1000),
+         "fundingRate": "0.0004", "markPrice": "100.0"},
+    ]
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        funding_rows={"FOOUSDT": bn_rows},
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    opened_signal = next(
+        e["payload"] for e in events if e["type"] == engine.POSITION_OPENED_SIGNAL
+    )
+    assert opened_signal["entry_gate"] == "spread"
+    opened_position = next(
+        e["payload"] for e in events if e["type"] == journal.POSITION_OPENED
+    )
+    assert opened_signal["entry_decision_apr"] == pytest.approx(
+        opened_position["signal_apr_at_entry"]
+    )
+    assert opened_signal["entry_decision_apr"] > cfg.enter_apr
+
+
+# --------------------------------------------------------------------------
+# 17. Re-review pins (M9, M13): two more plausible mutants that survived
+#     the first fix batch's own test suite.
+# --------------------------------------------------------------------------
+
+
+def test_spread_signal_excludes_partially_covered_settlement_windows() -> None:
+    """A Binance settlement whose window only has PART of its required HL
+    hourly coverage (1 of 4 hours, for a real 4h interval) must be
+    EXCLUDED from the EMA entirely -- not included with an understated
+    (partial) HL sum, which would bias the spread LOW and risk premature
+    exits. A mutant that checks `not window` (only excludes a fully EMPTY
+    window) instead of `len(window) < round(interval_hours)` (excludes
+    ANY partial window) lets this 1-of-4-hour window through and must
+    fail this.
+    """
+    e1 = T0 + timedelta(hours=8)   # first -- fallback 8h interval, FULLY covered below
+    e2 = T0 + timedelta(hours=12)  # 4h after e1 -- a real 4h interval, only 1 of 4 hours present
+    hl_hourly = [
+        *[(T0 + timedelta(hours=i), 0.0003) for i in range(1, 9)],  # T0+1h..T0+8h: e1's full window
+        (T0 + timedelta(hours=9), 0.0003),  # only ONE of e2's 4 required hours (T0+9h..T0+12h)
+    ]
+    binance_series = [(e1, 0.0004), (e2, 0.0001)]
+    as_of = T0 + timedelta(hours=13)
+
+    _, spread_apr = engine._spread_signal(hl_hourly, binance_series, as_of, ema_periods=1)
+
+    # ema_periods=1 -> alpha=1 -> the EMA collapses to the LAST VALID
+    # value. If e2 were wrongly included, it would BE that last value,
+    # completely hiding e1's contribution -- so this pins e1 alone:
+    # (8*0.0003 - 0.0004) * (8766/8).
+    expected = (8 * 0.0003 - 0.0004) * (engine.HOURS_PER_YEAR / 8)
+    assert spread_apr == pytest.approx(expected)
+
+
+def test_binance_series_is_stale_uses_the_events_own_interval_not_a_fixed_8h() -> None:
+    """Staleness must be judged against the EVENT'S OWN interval (here a
+    real 4h gap), not a hardcoded 8h assumption -- pinned with LITERAL
+    hours (not a reused engine constant), so a mutant that hardcodes 8h
+    can't coincidentally pass by sharing the test's own assumption.
+    """
+    as_of = T0 + timedelta(hours=20)
+
+    # Real 4h interval; newest event is 9h old -> stale under the correct
+    # 2x4h=8h threshold (9>8), but would read FRESH under a wrongly
+    # hardcoded 2x8h=16h threshold (9<16) -- this is the M13 pin.
+    stale_series = [
+        (as_of - timedelta(hours=13), 0.0001),
+        (as_of - timedelta(hours=9), 0.0002),
+    ]
+    assert engine._binance_series_is_stale(stale_series, as_of) is True
+
+    # Same real 4h interval; newest event is 7h old -> fresh under the
+    # correct 8h threshold (7<8) -- confirms the check isn't just
+    # "always True".
+    fresh_series = [
+        (as_of - timedelta(hours=11), 0.0001),
+        (as_of - timedelta(hours=7), 0.0002),
+    ]
+    assert engine._binance_series_is_stale(fresh_series, as_of) is False

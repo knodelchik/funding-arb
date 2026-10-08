@@ -1,18 +1,45 @@
-# M2 paper executor config. Universe: verified top HL carry names that have a
-# Binance hedge (spot preferred; perp where spot is unlisted).
+# M2 paper executor config. Universe v2 (2026-10-09): top hedgeable HL-carry
+# names from the wide-universe research, expanded 8 -> 13. hedge_mode=spot
+# wherever Binance lists the spot pair (HYPE/PUMP gained spot since v1 —
+# new entries hedge via spot; open positions keep their frozen mode).
+# XMR/FARTCOIN are perp-only on Binance -> spread-gated entries.
 capital_usd = 100000
-max_positions = 5
+max_positions = 8
 
 [[universe]]
 symbol = "HYPEUSDT"
 hl_coin = "HYPE"
-hedge_mode = "perp"     # no Binance spot for HYPE
+hedge_mode = "spot"
 max_notional = 20000
+
+[[universe]]
+symbol = "XMRUSDT"
+hl_coin = "XMR"
+hedge_mode = "perp"
+max_notional = 15000
+
+[[universe]]
+symbol = "FARTCOINUSDT"
+hl_coin = "FARTCOIN"
+hedge_mode = "perp"
+max_notional = 10000
 
 [[universe]]
 symbol = "PUMPUSDT"
 hl_coin = "PUMP"
-hedge_mode = "perp"
+hedge_mode = "spot"
+max_notional = 10000
+
+[[universe]]
+symbol = "ASTERUSDT"
+hl_coin = "ASTER"
+hedge_mode = "spot"
+max_notional = 10000
+
+[[universe]]
+symbol = "XPLUSDT"
+hl_coin = "XPL"
+hedge_mode = "spot"
 max_notional = 10000
 
 [[universe]]
@@ -50,3 +77,9 @@ symbol = "TAOUSDT"
 hl_coin = "TAO"
 hedge_mode = "spot"
 max_notional = 15000
+
+[[universe]]
+symbol = "LTCUSDT"
+hl_coin = "LTC"
+hedge_mode = "spot"
+max_notional = 20000

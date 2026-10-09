@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
-from farb.paper import broker, journal
+from farb.paper import broker, journal, universe
 from farb.paper.journal import PaperState
 from farb.paper.models import HedgeMode, PaperConfig, Position, SymbolSpec
 from farb.paper.report import render_report, render_status
@@ -425,33 +425,297 @@ def _binance_series_is_stale(bn_series: list[tuple[datetime, float]], as_of: dat
     return age_hours > BN_STALENESS_INTERVAL_MULTIPLE * interval_hours
 
 
-def _last_binance_gate_by_symbol(cfg: PaperConfig) -> dict[str, str]:
-    """The most recent SIGNAL_SNAPSHOT `gate` value per symbol, read
-    directly from the journal file (PaperState/`journal.replay` doesn't
+def _read_all_events(cfg: PaperConfig) -> list[dict[str, Any]]:
+    """Every journal event as a raw `{"type": ..., "payload": ...}` dict,
+    read ONCE per tick and shared by every engine-local view that needs
+    journal history `journal.replay()`'s own `PaperState` doesn't
+    reconstruct (SIGNAL_SNAPSHOT's gate history, dynamic-universe
+    membership) — one extra full read instead of one per view.
+    """
+    path = journal.journal_path(cfg)
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    with path.open() as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            events.append(json.loads(line))
+    return events
+
+
+def _last_binance_gate_by_symbol(events: list[dict[str, Any]]) -> dict[str, str]:
+    """The most recent SIGNAL_SNAPSHOT `gate` value per symbol, derived
+    from `_read_all_events`'s output (PaperState/`journal.replay` doesn't
     reconstruct SIGNAL_SNAPSHOT history — it's audit-trail-only, see
     journal.py's own docstring) — used ONLY to tell a NEW Binance-data
     outage (last tick's gate for this symbol was "spread") from an ONGOING
     one (already "absolute"), so the fallback warning fires once per
     outage rather than every tick it persists.
     """
-    path = journal.journal_path(cfg)
-    if not path.exists():
-        return {}
     last: dict[str, str] = {}
-    with path.open() as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue
-            event = json.loads(line)
-            if event["type"] == journal.SIGNAL_SNAPSHOT:
-                # Pre-spread-gate journal entries (before 2026-09-30) have no
-                # "gate" key; treat them as unknown rather than crashing —
-                # the live journal carries a month of them.
-                gate = event["payload"].get("gate")
-                if gate is not None:
-                    last[event["payload"]["symbol"]] = gate
+    for event in events:
+        if event["type"] == journal.SIGNAL_SNAPSHOT:
+            # Pre-spread-gate journal entries (before 2026-09-30) have no
+            # "gate" key; treat them as unknown rather than crashing —
+            # the live journal carries a month of them.
+            gate = event["payload"].get("gate")
+            if gate is not None:
+                last[event["payload"]["symbol"]] = gate
     return last
+
+
+def _any_pins_ever_recorded(events: list[dict[str, Any]]) -> bool:
+    """Whether ANY previously-journaled TICK_STARTED event carries a
+    "pins" snapshot at all — False only for a journal written ENTIRELY
+    before this feature existed. Used as the migration fallback: with no
+    pin history anywhere to retry a removal against, `_tick` falls back
+    to the pre-dynamic-universe behavior (any symbol absent from BOTH
+    pins and dynamic membership force-exits) for exactly as long as this
+    stays False — i.e. the first tick after deploying this feature, in a
+    journal that predates it; every tick from then on has at least its
+    own just-journaled "pins" snapshot to look back on next time.
+    """
+    return any(
+        event["type"] == journal.TICK_STARTED and event["payload"].get("pins") is not None
+        for event in events
+    )
+
+
+def _was_ever_pinned_since(
+    events: list[dict[str, Any]], symbol: str, since_ts: datetime
+) -> bool:
+    """Whether `symbol` appeared in ANY previously-journaled TICK_STARTED
+    pin snapshot recorded at or after `since_ts` (a position's own
+    `entry_ts`) — read directly from `events` (`journal.replay`'s own
+    PaperState doesn't reconstruct this at all; it's audit-trail-only for
+    everything but `last_tick_hour`).
+
+    This is what makes a pin-removal close RETRY every tick until it
+    actually succeeds, instead of firing once: comparing only the
+    IMMEDIATELY PREVIOUS tick's pins against the CURRENT tick's is
+    edge-triggered — once a removal is first detected (even if the
+    actual close attempt then fails that same tick, e.g. a crash right
+    after TICK_STARTED, or `exit_blocked` for lack of a live HL context),
+    the very NEXT tick's own "previous" snapshot already lacks the
+    symbol, and a two-tick boundary comparison would never fire again.
+    Scanning the symbol's WHOLE pin history since it opened is sticky
+    instead: it keeps reporting True every tick for as long as the
+    symbol stays unpinned, so the exit loop keeps retrying.
+    """
+    for event in events:
+        if event["type"] != journal.TICK_STARTED:
+            continue
+        pins = event["payload"].get("pins")
+        if pins is None:
+            continue
+        if symbol in pins and datetime.fromisoformat(event["ts"]) >= since_ts:
+            return True
+    return False
+
+
+def _run_hedge_delist_check(
+    cfg: PaperConfig,
+    state: PaperState,
+    membership: universe.UniverseMembership,
+    hl_client: Any,
+    binance_client: Any,
+    hour: datetime,
+    now: datetime,
+) -> tuple[universe.UniverseMembership, universe.BinanceSymbols | None]:
+    """Check whether any OPEN position's hedge has stopped TRADING on
+    Binance entirely, on its OWN daily cadence — independent of
+    `cfg.universe_scan.enabled`, since an open position must never be
+    exposed to a delisted hedge indefinitely just because the scanner
+    feature happens to be off.
+
+    Runs FIRST among the two end-of-tick scanner steps (before
+    `_run_universe_scan`): a chronically-timing-out or crashing SCAN must
+    never starve delist protection, so delist protection goes first, not
+    second. Returns the updated membership plus the freshly-fetched,
+    TRUSTED `BinanceSymbols` IF this check fetched one this tick (None
+    otherwise, including when the fetch failed OR the sanity breaker
+    judged it untrustworthy) — `_run_universe_scan` reuses it instead of
+    fetching its own copy when both run in the same tick.
+
+    A hedge must look delisted on HEDGE_DELIST_CONFIRM_CHECKS consecutive
+    checks before its position is actually force-closed — closed HERE,
+    using fresh marks fetched at this point (never deferred to the next
+    tick); the first sighting only journals a warning. The sanity breaker
+    (see `universe.check_hedge_delisting`) judges the exchangeInfo
+    RESPONSE itself, not what fraction of open positions look delisted —
+    on a trip: warn once, close nothing, streaks AND the breaker's own
+    known-good baseline counts untouched.
+
+    A fetch failure journals ONE warning and leaves `membership`
+    UNCHANGED, same discipline as a scan failure.
+    """
+    due = membership.last_delist_check_hour is None or (
+        hour - membership.last_delist_check_hour
+        >= timedelta(hours=universe.HEDGE_DELIST_CHECK_INTERVAL_HOURS)
+    )
+    if not due:
+        return membership, None
+
+    try:
+        binance_symbols = universe.fetch_binance_tradeable_symbols(binance_client)
+    except Exception as exc:  # noqa: BLE001 - a delist-check outage must never crash the tick
+        journal.append_event(
+            cfg, journal.WARNING,
+            {"message": f"hedge-delist check failed, keeping previous state: {exc}"},
+            now,
+        )
+        return membership, None
+
+    positions = {symbol: pos.hedge_mode for symbol, pos in state.open_positions.items()}
+    result = universe.check_hedge_delisting(positions, binance_symbols, membership)
+
+    journal.append_event(
+        cfg, universe.HEDGE_DELIST_CHECKED,
+        {
+            "hour": hour.isoformat(),
+            "delist_streak": result.delist_streak,
+            "sanity_breaker_tripped": result.sanity_breaker_tripped,
+            "spot_count": result.spot_count,
+            "perp_count": result.perp_count,
+        },
+        now,
+    )
+    membership.last_delist_check_hour = hour
+    membership.delist_streak = result.delist_streak
+    membership.last_delist_spot_count = result.spot_count
+    membership.last_delist_perp_count = result.perp_count
+
+    if result.sanity_breaker_tripped:
+        journal.append_event(
+            cfg, journal.WARNING,
+            {
+                "message": "hedge-delist sanity breaker tripped (spot/perp symbol count "
+                "collapsed relative to its own last known-good baseline) -- treating as a bad "
+                "exchangeInfo response, closing nothing",
+            },
+            now,
+        )
+        return membership, None  # untrusted -- the scan must fetch its own, not reuse this
+
+    for symbol in result.first_sighting:
+        journal.append_event(
+            cfg, journal.WARNING,
+            {
+                "symbol": symbol,
+                "message": "hedge appears delisted on Binance (1st consecutive check) -- "
+                "confirming before force-exit",
+            },
+            now,
+        )
+
+    for symbol in result.newly_confirmed:
+        position = state.open_positions.get(symbol)
+        if position is None:
+            continue  # already closed by something else this tick -- nothing to do
+        _close_position(
+            cfg, state, position, hl_client, binance_client, now,
+            exit_reason="hedge_delisted",
+        )
+
+    return membership, binance_symbols
+
+
+def _run_universe_scan(
+    cfg: PaperConfig,
+    membership: universe.UniverseMembership,
+    hl_client: Any,
+    binance_client: Any,
+    asset_ctxs: dict[str, Any],
+    binance_symbols_hint: universe.BinanceSymbols | None,
+    hour: datetime,
+    now: datetime,
+) -> universe.UniverseMembership:
+    """Run the dynamic-universe scan if due, journal its outcome, and
+    return the UPDATED in-memory membership (mirroring the events just
+    journaled, exactly like `_finalize_close` keeps `state` consistent
+    with what it just wrote). `binance_symbols_hint`, when not None,
+    reuses `_run_hedge_delist_check`'s already-fetched (and TRUSTED)
+    exchangeInfo instead of fetching a second copy this tick.
+
+    Called from the END of `_tick`, AFTER both this tick's own trading
+    decisions (exits/entries) AND the hedge-delist check are already
+    journaled: a scan failure (or, in principle, an unanticipated crash
+    inside this function) can therefore never prevent or delay trading
+    OR delist protection, only the scanner's own bookkeeping for this
+    tick.
+
+    A total scan failure (HL/Binance API error, or a
+    `universe.ScanProbeDegradedError` when too many per-coin probes
+    failed) journals ONE warning and returns `membership` UNCHANGED — the
+    scanner must never wipe existing membership just because a fetch
+    failed, and must never confuse "couldn't reach Binance" with "nothing
+    is tradeable anymore" (which would look identical otherwise).
+
+    Disabled (`cfg.universe_scan.enabled` False, the default) is a no-op.
+    """
+    if not cfg.universe_scan.enabled:
+        return membership
+
+    due = membership.last_scan_hour is None or (
+        hour - membership.last_scan_hour >= timedelta(hours=cfg.universe_scan.scan_interval_hours)
+    )
+    if not due:
+        return membership
+
+    pinned_symbols = {s.symbol for s in cfg.universe}
+    try:
+        binance_symbols = (
+            binance_symbols_hint if binance_symbols_hint is not None
+            else universe.fetch_binance_tradeable_symbols(binance_client)
+        )
+        scan_result = universe.scan_candidates(
+            asset_ctxs, binance_symbols, hl_client, cfg.universe_scan, pinned_symbols, now
+        )
+    except Exception as exc:  # noqa: BLE001 - a scanner outage must never crash the tick or wipe membership
+        journal.append_event(
+            cfg, journal.WARNING,
+            {"message": f"universe scan failed, keeping previous membership: {exc}"},
+            now,
+        )
+        return membership
+
+    update = universe.apply_hysteresis(membership, scan_result, cfg.universe_scan)
+
+    journal.append_event(
+        cfg, universe.UNIVERSE_SCANNED,
+        {
+            "hour": hour.isoformat(),
+            "qualifying": [c.model_dump(mode="json") for c in scan_result.qualifying],
+            "dropped_invalid_names": scan_result.dropped_invalid_names,
+            "probe_attempts": scan_result.probe_attempts,
+            "probe_failures": scan_result.probe_failures,
+            "qualify_streak": update.qualify_streak,
+            "disqualify_streak": update.disqualify_streak,
+            "criteria_snapshot": cfg.universe_scan.model_dump(mode="json"),
+        },
+        now,
+    )
+    membership.last_scan_hour = hour
+    membership.scan_count += 1
+    membership.qualify_streak = update.qualify_streak
+    membership.disqualify_streak = update.disqualify_streak
+
+    for spec in update.to_add:
+        journal.append_event(
+            cfg, universe.UNIVERSE_MEMBER_ADDED,
+            {"symbol": spec.symbol, "reason": "qualified", "spec": spec.model_dump(mode="json")},
+            now,
+        )
+        membership.dynamic_members[spec.symbol] = spec
+    for symbol, reason in update.to_remove:
+        journal.append_event(
+            cfg, universe.UNIVERSE_MEMBER_REMOVED, {"symbol": symbol, "reason": reason}, now
+        )
+        membership.dynamic_members.pop(symbol, None)
+
+    return membership
 
 
 def _binance_bookticker(binance_client: Any, symbol: str, hedge_mode: HedgeMode) -> dict[str, Any]:
@@ -630,6 +894,7 @@ def _finalize_close(
     liquidated: bool,
     exit_gate: str | None = None,
     exit_decision_apr: float | None = None,
+    exit_reason: str | None = None,
 ) -> None:
     """Shared decomposition + journal-write for both a normal close and a
     liquidation — they differ only in how `fills` were obtained and the
@@ -637,8 +902,14 @@ def _finalize_close(
 
     `exit_gate`/`exit_decision_apr` (None for a liquidation, which isn't
     signal-driven) record which gate and APR actually triggered a
-    signal-driven close, for auditability -- extends the JOURNAL payload
-    only, journal.py's `ClosedPosition`/schema is untouched.
+    signal-driven close, for auditability. `exit_reason` is None for an
+    ordinary signal-driven close and "hedge_delisted" for a HARD universe
+    removal (the hedge symbol stopped being TRADING on Binance entirely —
+    see `_run_universe_scan`); a plain SOFT removal (a dynamic member
+    degraded, or a pin dropped from the config) is NOT a close reason at
+    all anymore -- the position just keeps riding its own signal. All
+    three extend the JOURNAL payload only, journal.py's `ClosedPosition`/
+    schema is untouched.
     """
     hl_exit, hedge_exit = fills
     entry_hl = next(f for f in position.entry_fills if f.leg == "hl_short")
@@ -673,6 +944,7 @@ def _finalize_close(
             "liquidated": liquidated,
             "exit_gate": exit_gate,
             "exit_decision_apr": exit_decision_apr,
+            "exit_reason": exit_reason,
         },
         now,
     )
@@ -706,6 +978,7 @@ def _close_position(
     *,
     exit_gate: str | None = None,
     exit_decision_apr: float | None = None,
+    exit_reason: str | None = None,
 ) -> None:
     hl_book = hl_client.book_top(position.hl_coin)
     hedge_price = _binance_book_price(
@@ -714,7 +987,7 @@ def _close_position(
     fills = broker.close_pair(position, hl_book, hedge_price, now, cfg)
     _finalize_close(
         cfg, state, position, fills, now, liquidated=False,
-        exit_gate=exit_gate, exit_decision_apr=exit_decision_apr,
+        exit_gate=exit_gate, exit_decision_apr=exit_decision_apr, exit_reason=exit_reason,
     )
 
 
@@ -941,7 +1214,30 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
     if state.last_tick_hour is not None and state.last_tick_hour == hour:
         journal.append_event(cfg, journal.TICK_SKIPPED_DUPLICATE, {"hour": hour.isoformat()}, now)
         return
-    journal.append_event(cfg, journal.TICK_STARTED, {"hour": hour.isoformat()}, now)
+
+    # pins/events/has_pin_history are all read/computed BEFORE this
+    # tick's own TICK_STARTED is appended below -- `events` must reflect
+    # the state as of the START of this tick (whatever PRIOR ticks
+    # recorded), not include this tick's own not-yet-written pin
+    # snapshot, or a symbol pinned only as of THIS tick would wrongly
+    # look like it's always been pinned.
+    pinned_symbols = {s.symbol for s in cfg.universe}
+    events = _read_all_events(cfg)
+    has_pin_history = _any_pins_ever_recorded(events)
+
+    # The pin set is journaled on EVERY tick's own TICK_STARTED event --
+    # `journal.replay`'s PaperState only reads "hour" from this payload,
+    # ignoring "pins" entirely, so this needs no journal.py change. It's
+    # what lets the exit loop below tell "this symbol was EVER a pin
+    # since this position opened and isn't one now" (hard force-exit,
+    # the operator's only manual close) from "this symbol was never a
+    # pin at all" by scanning the symbol's WHOLE recorded pin history,
+    # not just a two-tick boundary (see `_was_ever_pinned_since`'s own
+    # docstring for why a boundary comparison can't be retried).
+    journal.append_event(
+        cfg, journal.TICK_STARTED,
+        {"hour": hour.isoformat(), "pins": sorted(pinned_symbols)}, now,
+    )
 
     if hl_client is None:
         from farb.hl.client import HLClient
@@ -953,32 +1249,51 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
         binance_client = BinanceClient()
 
     asset_ctxs: dict[str, AssetCtx] = hl_client.asset_ctxs()
-    universe_by_symbol = {s.symbol: s for s in cfg.universe}
 
-    # Signals are computed for the UNION of universe symbols and symbols
-    # with an open position: a position whose symbol left the universe
-    # must still be priceable (and closeable) from the Position's own
-    # hl_coin, not from a config lookup that may no longer find it.
-    hl_coin_by_symbol: dict[str, str] = {s.symbol: s.hl_coin for s in cfg.universe}
+    # The scan itself (and the separate hedge-delist check) run at the
+    # END of this function, AFTER trading -- see `_run_hedge_delist_
+    # check`'s docstring for why. `membership` here reflects the state as
+    # of the START of this tick (i.e. whatever the LAST tick's scan
+    # produced), which is exactly what this tick's own trading decisions
+    # should use. Reuses the SAME `events` read above (TICK_STARTED
+    # entries are irrelevant to this replay, so reading it before vs.
+    # after appending this tick's own doesn't matter here).
+    membership = universe.replay_membership(events)
+
+    # Effective universe = config PINS union current dynamic members
+    # (journal-derived) -- pins win on a symbol conflict. cfg.universe
+    # entries are never touched by the scanner; a dynamic member is only
+    # ever added when its symbol ISN'T already pinned (see
+    # universe.apply_hysteresis), but this is enforced again here too so
+    # a pin added AFTER a symbol became a dynamic member still wins.
+    effective_universe: list[SymbolSpec] = list(cfg.universe) + [
+        spec for symbol, spec in membership.dynamic_members.items() if symbol not in pinned_symbols
+    ]
+
+    # Signals are computed for the UNION of effective-universe symbols and
+    # symbols with an open position: a position whose symbol left the
+    # effective universe must still be priceable (and, on its own signal,
+    # closeable) from the Position's own hl_coin, not from a config/scan
+    # lookup that may no longer find it.
+    hl_coin_by_symbol: dict[str, str] = {s.symbol: s.hl_coin for s in effective_universe}
     for symbol, position in state.open_positions.items():
         hl_coin_by_symbol.setdefault(symbol, position.hl_coin)
     # Same union-with-open-positions logic for hedge_mode, but an OPEN
     # position's own hedge_mode (frozen at entry) ALWAYS wins over the
-    # config's, even when the symbol is STILL in cfg.universe -- unlike
-    # hl_coin above, hedge_mode can be edited in place for an existing
-    # universe entry (a config flip PERP->SPOT), and re-gating an already
-    # -open perp position onto the absolute-HL signal just because the
-    # config now says SPOT would silently stop accounting for the Binance
-    # funding it's actually still paying away.
-    hedge_mode_by_symbol: dict[str, HedgeMode] = {s.symbol: s.hedge_mode for s in cfg.universe}
+    # config's/scanner's, even when the symbol is STILL in the effective
+    # universe -- unlike hl_coin above, hedge_mode can be edited in place
+    # for an existing universe entry (a config flip PERP->SPOT), and
+    # re-gating an already-open perp position onto the absolute-HL signal
+    # just because the config now says SPOT would silently stop
+    # accounting for the Binance funding it's actually still paying away.
+    hedge_mode_by_symbol: dict[str, HedgeMode] = {
+        s.symbol: s.hedge_mode for s in effective_universe
+    }
     for symbol, position in state.open_positions.items():
         hedge_mode_by_symbol[symbol] = position.hedge_mode
 
-    # Only consulted for PERP symbols' fallback-warning dedup below; a full
-    # extra journal scan, but a cheap one relative to `journal.replay`'s
-    # own full pass moments ago, and SIGNAL_SNAPSHOT history isn't
-    # reconstructed by replay() at all (see its own docstring).
-    last_gate_by_symbol = _last_binance_gate_by_symbol(cfg)
+    # Only consulted for PERP symbols' fallback-warning dedup below.
+    last_gate_by_symbol = _last_binance_gate_by_symbol(events)
 
     signals: dict[str, _Signal] = {}
     for symbol, hl_coin in hl_coin_by_symbol.items():
@@ -1036,7 +1351,6 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
     # the backtest: accrue, then decide whether this event is also the exit).
     for symbol in list(state.open_positions):
         position = state.open_positions[symbol]
-        spec = universe_by_symbol.get(symbol)
         sig = signals.get(symbol)
         can_price = sig is not None and sig.ctx is not None
 
@@ -1064,15 +1378,51 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
         if exit_apr is None and sig is not None and sig.hl_apr is not None:
             exit_apr, exit_gate = sig.hl_apr, "absolute"
 
-        left_universe = spec is None
+        # PIN removal vs scanner (dynamic-member) removal are NOT the
+        # same thing: removing a CONFIG PIN is the operator's only manual
+        # close (the CLI has no close command) and still force-exits
+        # immediately, exactly as before the scanner existed. A symbol
+        # the SCANNER drops is governed by soft-removal instead -- it
+        # keeps accruing/signaling on its own frozen hl_coin/hedge_mode
+        # and exits only on its own signal. This is decided by OPERATOR
+        # ACTION, not symbol history (regardless of whether it's ALSO a
+        # dynamic member right now -- an operator un-pinning a symbol
+        # that's still separately scanner-managed still force-closes the
+        # existing position; the symbol may legitimately re-enter later
+        # via its own dynamic membership, which is correct, not a bug).
+        #
+        # `pin_removed` is STICKY, not a one-shot edge comparison: it's
+        # True whenever the symbol has EVER been recorded as pinned since
+        # this position's own entry_ts and ISN'T pinned right now --
+        # scanning the symbol's WHOLE pin history, not just the
+        # immediately previous tick's. A one-shot "previous vs current"
+        # comparison would only fire on the EXACT tick the removal is
+        # first detected; if that tick's own close attempt then fails
+        # (a crash right after TICK_STARTED, or exit_blocked for lack of
+        # a live HL context), the next tick's "previous" snapshot already
+        # lacks the symbol and the comparison would never fire again,
+        # stranding the position pinned-removed-but-never-closed forever.
+        # With no pin history recorded ANYWHERE yet (a journal written
+        # entirely before this feature existed), there's nothing to scan
+        # -- fall back to the pre-dynamic-universe behavior instead (any
+        # symbol absent from both pins and dynamic membership force
+        # -exits), which correctly covers a pin removed in the very same
+        # deploy window this feature ships in.
+        if has_pin_history:
+            pin_removed = symbol not in pinned_symbols and _was_ever_pinned_since(
+                events, symbol, position.entry_ts
+            )
+        else:
+            pin_removed = symbol not in pinned_symbols and symbol not in membership.dynamic_members
         signal_exit = exit_apr is not None and exit_apr < cfg.exit_apr
-        should_exit = left_universe or signal_exit
+        should_exit = pin_removed or signal_exit
         if should_exit and can_price:
             _close_position(
                 cfg, state, position, hl_client, binance_client, now,
                 exit_gate=exit_gate, exit_decision_apr=exit_apr,
+                exit_reason="pin_removed" if pin_removed else None,
             )
-            decisions[symbol] = "exit"
+            decisions[symbol] = "exit_pin_removed" if pin_removed else "exit"
         elif should_exit:
             journal.append_event(
                 cfg, journal.WARNING,
@@ -1093,7 +1443,7 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
 
     free_slots = cfg.max_positions - len(state.open_positions)
     candidates: list[tuple[float, SymbolSpec, Any, float, str]] = []
-    for spec in cfg.universe:
+    for spec in effective_universe:
         if spec.symbol in state.open_positions:
             continue
         sig = signals[spec.symbol]
@@ -1123,21 +1473,41 @@ def _tick(cfg: PaperConfig, hl_client: Any, binance_client: Any, now: datetime) 
     for _, spec, _, _, _ in candidates[free_slots:] if free_slots > 0 else candidates:
         decisions.setdefault(spec.symbol, "skip_no_slot")
 
-    for spec in cfg.universe:
-        sig = signals[spec.symbol]
+    # The UNION of effective-universe symbols and open-position symbols
+    # (same set `hl_coin_by_symbol`/`signals` are already keyed by) --
+    # NOT just `effective_universe` alone. A position riding its own
+    # signal after a SOFT removal would otherwise get no SIGNAL_SNAPSHOT
+    # at all once its symbol leaves the effective universe: invisible to
+    # audit, and silently breaking the Binance-fallback warn-once dedup
+    # too (`_last_binance_gate_by_symbol` reads this same event type).
+    for symbol in hl_coin_by_symbol:
+        sig = signals[symbol]
         journal.append_event(
             cfg, journal.SIGNAL_SNAPSHOT,
             {
-                "symbol": spec.symbol,
+                "symbol": symbol,
                 "ema_apr": sig.decision_apr,
                 "hl_apr": sig.hl_apr,
                 "bn_apr": sig.bn_apr,
                 "spread_apr": sig.spread_apr,
                 "gate": sig.gate,
                 "next_hour_funding": sig.next_hour_funding,
-                "decision": decisions.get(spec.symbol, "hold"),
+                "decision": decisions.get(symbol, "hold"),
             },
             now,
         )
+
+    # The delist check and the scan run LAST, after every trading
+    # decision above is already journaled -- and the delist check runs
+    # BEFORE the scan (not after): a chronically-timing-out or crashing
+    # scan must never starve delist protection. See
+    # `_run_hedge_delist_check`'s docstring for the full reasoning.
+    membership, binance_symbols_from_delist_check = _run_hedge_delist_check(
+        cfg, state, membership, hl_client, binance_client, hour, now
+    )
+    membership = _run_universe_scan(
+        cfg, membership, hl_client, binance_client, asset_ctxs,
+        binance_symbols_from_delist_check, hour, now,
+    )
 
     journal.write_parquet_mirror(cfg)

@@ -31,10 +31,33 @@ class SymbolSpec(BaseModel):
     max_notional: float = Field(gt=0)  # per-position cap, USD
 
 
+class UniverseScanConfig(BaseModel):
+    """Daily scanner that adds/retires dynamic universe members.
+
+    Config `universe` entries are PINS the scanner never touches; scanner
+    picks extend them. Membership hysteresis (add_after/remove_after
+    consecutive scans) exists because churn is fees: a name flapping in and
+    out of the list must not flap positions with it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    scan_interval_hours: float = Field(default=24, ge=1)
+    min_open_interest_usd: float = Field(default=7_000_000, gt=0)
+    min_history_days: int = Field(default=90, ge=1)  # GRAM lesson: young = untrusted
+    min_trailing_carry_apr: float = 0.08  # 30d mean funding, annualized
+    add_after_scans: int = Field(default=2, ge=1)
+    remove_after_scans: int = Field(default=7, ge=1)
+    max_dynamic_members: int = Field(default=12, ge=0)
+    default_max_notional: float = Field(default=10_000, gt=0)
+
+
 class PaperConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     universe: list[SymbolSpec]
+    universe_scan: UniverseScanConfig = UniverseScanConfig()
     capital_usd: float = Field(default=100_000, gt=0)
     max_positions: int = Field(default=5, ge=1)
 

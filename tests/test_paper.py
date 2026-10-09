@@ -18,8 +18,8 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from farb.paper import broker, engine, journal, report
-from farb.paper.models import Fill, HedgeMode, PaperConfig, Position, SymbolSpec
+from farb.paper import broker, engine, journal, report, universe
+from farb.paper.models import Fill, HedgeMode, PaperConfig, Position, SymbolSpec, UniverseScanConfig
 from farb.schemas import FUNDING_SCHEMA, KLINE_SCHEMA
 
 T0 = datetime(2025, 6, 1, tzinfo=UTC)
@@ -61,18 +61,52 @@ class FakeHLClient:
     funding: dict[str, list[FakeFundingEvent]] = field(default_factory=dict)
     books: dict[str, FakeBookTop] = field(default_factory=dict)
     raise_on_funding_history: bool = False
+    raise_on_asset_ctxs: bool = False
 
     def asset_ctxs(self) -> dict[str, FakeAssetCtx]:
+        if self.raise_on_asset_ctxs:
+            raise RuntimeError("simulated HL outage")
         return self.ctxs
 
-    def funding_history(self, coin: str, start_ms: int) -> list[FakeFundingEvent]:
+    def funding_history(
+        self, coin: str, start_ms: int, end_ms: int | None = None
+    ) -> list[FakeFundingEvent]:
         if self.raise_on_funding_history:
             raise RuntimeError("simulated HL outage")
         events = self.funding.get(coin, [])
-        return [e for e in events if round(e.time.timestamp() * 1000) >= start_ms]
+        return [
+            e for e in events
+            if round(e.time.timestamp() * 1000) >= start_ms
+            and (end_ms is None or round(e.time.timestamp() * 1000) < end_ms)
+        ]
 
     def book_top(self, coin: str) -> FakeBookTop:
         return self.books[coin]
+
+
+def _padded_exchange_info(
+    tradeable: set[str], *, contract_type: str | None = None, floor: int = 220
+) -> dict:
+    """A fake Binance exchangeInfo response with `tradeable` symbols
+    explicitly present, padded with enough filler symbols to comfortably
+    clear the hedge-delist sanity breaker's absolute floor
+    (universe.HEDGE_DELIST_ABSOLUTE_FLOOR = 200) -- anything NOT in
+    `tradeable` (and not filler) is genuinely absent, simulating a real
+    single-symbol delisting without the response itself looking
+    truncated.
+    """
+    entries = [
+        {"symbol": symbol, "status": "TRADING", "quoteAsset": "USDT"}
+        for symbol in tradeable
+    ]
+    entries.extend(
+        {"symbol": f"FILLERPAD{i}USDT", "status": "TRADING", "quoteAsset": "USDT"}
+        for i in range(floor)
+    )
+    if contract_type is not None:
+        for entry in entries:
+            entry["contractType"] = contract_type
+    return {"symbols": entries}
 
 
 @dataclass
@@ -80,8 +114,32 @@ class FakeBinanceClient:
     book_tickers: dict[str, dict[str, str]] = field(default_factory=dict)
     funding_rows: dict[str, list[dict]] = field(default_factory=dict)
     raise_on_get_list: bool = False
+    # Default to the dominant test symbol (FOOUSDT) showing TRADING on
+    # BOTH venues, PADDED with filler past the hedge-delist sanity
+    # breaker's absolute floor (200) -- the delist check now runs on
+    # every tick regardless of universe_scan.enabled (see engine.
+    # _run_hedge_delist_check), judging the RESPONSE's own symbol count,
+    # not how many open positions look delisted, so even a single open
+    # FOOUSDT position needs a response that looks like a real exchange
+    # by default (a bare 1-symbol response would itself look truncated).
+    # Tests that DO care about delisting override these explicitly.
+    spot_exchange_info: dict = field(
+        default_factory=lambda: _padded_exchange_info({"FOOUSDT"})
+    )
+    perp_exchange_info: dict = field(
+        default_factory=lambda: _padded_exchange_info({"FOOUSDT"}, contract_type="PERPETUAL")
+    )
+    raise_on_exchange_info: bool = False
 
     def get(self, base: str, path: str, params: dict) -> dict:
+        if path == universe.SPOT_EXCHANGE_INFO_PATH:
+            if self.raise_on_exchange_info:
+                raise RuntimeError("simulated Binance outage")
+            return self.spot_exchange_info
+        if path == universe.PERP_EXCHANGE_INFO_PATH:
+            if self.raise_on_exchange_info:
+                raise RuntimeError("simulated Binance outage")
+            return self.perp_exchange_info
         return self.book_tickers[params["symbol"]]
 
     def get_list(self, base: str, path: str, params: dict) -> list[dict]:
@@ -904,37 +962,822 @@ def test_no_liquidation_just_below_threshold_only_margin_warning(tmp_path: Path)
 
 
 # --------------------------------------------------------------------------
-# 11. Universe removal must not freeze an open position
+# 11. Universe removal: a removed CONFIG PIN still force-exits (the
+#     operator's only manual close, unconditional); a symbol the SCANNER
+#     drops (soft) rides its own signal instead; a hedge delisted on
+#     Binance entirely (hard) needs 2 consecutive daily checks before it
+#     force-exits.
 # --------------------------------------------------------------------------
 
 
-def test_position_closes_when_symbol_removed_from_universe(tmp_path: Path) -> None:
-    """A position whose symbol is removed from cfg.universe must still be
-    priced (from Position.hl_coin/hedge_mode, not a config lookup) and
-    closed on the next tick — not frozen forever with its slot occupied.
+def test_position_closes_when_pin_removed_from_config(tmp_path: Path) -> None:
+    """Removing a CONFIG PIN still force-exits its position immediately,
+    exactly as before the scanner existed -- that is the operator's only
+    manual close (the CLI has no close command), unconditional on
+    universe_scan.enabled. A mutant that treats this the same as a
+    scanner-dropped (soft) removal would leave it open; this test fails
+    on that mutant.
     """
     cfg = _make_cfg(tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0)
     position = _liquidation_test_position()
     journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), T0)
 
-    cfg_removed = _make_cfg(tmp_path, universe=[], max_positions=1)
-    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
     hl = FakeHLClient(
         ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
         books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
     )
     binance = FakeBinanceClient(book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"}})
 
-    engine.run_paper("tick", cfg_removed, hl_client=hl, binance_client=binance, now=hour1)
+    # Tick 1: pin still present -- journals THIS tick's pin set, which
+    # becomes the "previous" baseline the next tick's removal is judged
+    # against (pin_removed is decided by comparing journaled pin
+    # snapshots across ticks, not by inferring history from config alone).
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour1)
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions, "still pinned -- must not close yet"
+
+    # Tick 2: pin removed from cfg.universe -- must now force-exit.
+    cfg_removed = _make_cfg(tmp_path, universe=[], max_positions=1)
+    hour2 = journal.hour_bucket(T0 + timedelta(hours=2))
+    engine.run_paper("tick", cfg_removed, hl_client=hl, binance_client=binance, now=hour2)
 
     state = journal.replay(journal.journal_path(cfg_removed))
-    assert "FOOUSDT" not in state.open_positions, "must close, not freeze, after universe removal"
+    assert "FOOUSDT" not in state.open_positions, "pin removal must still force-exit"
     assert len(state.closed) == 1
 
     lines = journal.journal_path(cfg_removed).read_text().splitlines()
     events = [json.loads(line) for line in lines]
-    warning_msgs = [e["payload"]["message"] for e in events if e["type"] == journal.WARNING]
-    assert not any("no live HL context" in m for m in warning_msgs)
+    closed = next(e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED)
+    assert closed["exit_reason"] == "pin_removed"
+
+
+def test_position_soft_removal_of_scanner_dropped_member_rides_its_own_signal(
+    tmp_path: Path,
+) -> None:
+    """A DYNAMIC member the SCANNER later drops (not a config pin) must
+    NOT be force-exited -- it keeps riding its own signal on its frozen
+    hl_coin/hedge_mode, exits only when its own signal says so, and
+    cannot re-enter afterward (absent from both pins and current dynamic
+    membership). This symbol was NEVER pinned (only ever scanner
+    -managed), which is why `_was_ever_pinned_since` never fires for it.
+    A mutant that force-exits ANY symbol absent from the effective
+    universe (the pre-review-fix behavior) fails the very first assertion.
+    """
+    cfg = _make_cfg(
+        tmp_path, universe=[], max_positions=1, maker_fill_prob=1.0,
+        ema_periods=1, enter_apr=0.12, exit_apr=0.005,
+    )
+    hour0 = journal.hour_bucket(T0)
+    spec = SymbolSpec(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=10_000
+    )
+    # A real (pins-aware) prior tick, establishing pin history BEFORE the
+    # scanner add/remove below -- without this, `_any_pins_ever_recorded`
+    # would read False and the MIGRATION fallback (not this test's own
+    # scanner-soft-removal path) would apply instead, which isn't what
+    # this test is about.
+    journal.append_event(
+        cfg, journal.TICK_STARTED,
+        {"hour": (T0 - timedelta(hours=3)).isoformat(), "pins": []},
+        T0 - timedelta(hours=3),
+    )
+    # Simulate: a PRIOR scan added, then a LATER scan removed, this symbol.
+    journal.append_event(
+        cfg, universe.UNIVERSE_MEMBER_ADDED,
+        {"symbol": "FOOUSDT", "reason": "qualified", "spec": spec.model_dump(mode="json")},
+        T0 - timedelta(hours=2),
+    )
+    journal.append_event(
+        cfg, universe.UNIVERSE_MEMBER_REMOVED,
+        {"symbol": "FOOUSDT", "reason": "degraded"},
+        T0 - timedelta(hours=1),
+    )
+    position = Position(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, qty=10.0,
+        notional_entry=1000.0, entry_ts=hour0,
+        entry_fills=[
+            Fill(venue="hyperliquid", leg="hl_short", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=True, ts=hour0),
+            Fill(venue="binance", leg="hedge_long", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=False, ts=hour0),
+        ],
+        funding_received_usd=0.0, funding_paid_usd=0.0, signal_apr_at_entry=0.5,
+    )
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), hour0)
+
+    # Step 1: no HL funding history at all -- the signal reads None, so
+    # there's no signal-driven reason to exit either. If removal alone
+    # still force-exited, this tick would close it; it must not.
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}}
+    )
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=1)
+    )
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions, "scanner-dropped member must NOT force-exit"
+    assert len(state.closed) == 0
+
+    # Step 2: strongly NEGATIVE HL funding -- now its OWN signal says exit.
+    hl.funding["FOO"] = _hourly_rates(hour0 + timedelta(hours=1), [-0.0005] * 8, "FOO")
+    hl.ctxs["FOO"] = FakeAssetCtx(coin="FOO", funding_hourly=-0.0005, mark_px=100.0)
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=9)
+    )
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions, "must still exit on its OWN signal"
+    assert len(state.closed) == 1
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    closed = [e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED][-1]
+    assert closed["exit_reason"] is None  # NOT pin_removed, NOT hedge_delisted
+
+    # Step 3: now a STRONGLY qualifying entry signal -- but the symbol is
+    # absent from both pins and dynamic membership, so it must not re-enter.
+    hl.funding["FOO"] = _hourly_rates(hour0 + timedelta(hours=10), [0.0005] * 8, "FOO")
+    hl.ctxs["FOO"] = FakeAssetCtx(coin="FOO", funding_hourly=0.0005, mark_px=100.0)
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=18)
+    )
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions, "soft removal must still block a NEW entry"
+
+
+def test_position_hard_removal_exits_on_second_consecutive_delist_check(tmp_path: Path) -> None:
+    """A HARD removal -- the hedge symbol no longer TRADING on Binance AT
+    ALL -- requires TWO consecutive daily checks before force-exiting
+    (the first sighting only warns, per the 2026-10-09 fix batch). Three
+    open positions, only FOOUSDT delisted (33% < the 50% sanity-breaker
+    threshold), so the breaker itself doesn't mask the behavior under
+    test; isolated from any signal contribution (no HL funding history
+    at all for any of them, so the signal could never cause this exit on
+    its own).
+    """
+    scan_cfg = UniverseScanConfig(enabled=True, scan_interval_hours=24)
+    bar_spec = SymbolSpec(
+        symbol="BARUSDT", hl_coin="BAR", hedge_mode=HedgeMode.SPOT, max_notional=10_000
+    )
+    baz_spec = SymbolSpec(
+        symbol="BAZUSDT", hl_coin="BAZ", hedge_mode=HedgeMode.SPOT, max_notional=10_000
+    )
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC, bar_spec, baz_spec], maker_fill_prob=1.0,
+        max_positions=3, universe_scan=scan_cfg,
+    )
+    foo_position = _liquidation_test_position()  # symbol=FOOUSDT, hedge_mode=PERP
+    bar_position = Position(
+        symbol="BARUSDT", hl_coin="BAR", hedge_mode=HedgeMode.SPOT, qty=10.0,
+        notional_entry=1000.0, entry_ts=T0,
+        entry_fills=[
+            Fill(venue="hyperliquid", leg="hl_short", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=True, ts=T0),
+            Fill(venue="binance", leg="hedge_long", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=False, ts=T0),
+        ],
+        funding_received_usd=0.0, funding_paid_usd=0.0, signal_apr_at_entry=0.5,
+    )
+    baz_position = bar_position.model_copy(update={"symbol": "BAZUSDT", "hl_coin": "BAZ"})
+    for pos in (foo_position, bar_position, baz_position):
+        journal.append_event(cfg, journal.POSITION_OPENED, pos.model_dump(mode="json"), T0)
+
+    hl = FakeHLClient(
+        ctxs={
+            "FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0),
+            "BAR": FakeAssetCtx(coin="BAR", funding_hourly=0.0001, mark_px=100.0),
+            "BAZ": FakeAssetCtx(coin="BAZ", funding_hourly=0.0001, mark_px=100.0),
+        },
+        books={
+            "FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0),
+            "BAR": FakeBookTop(coin="BAR", best_bid=99.0, best_ask=101.0),
+            "BAZ": FakeBookTop(coin="BAZ", best_bid=99.0, best_ask=101.0),
+        },
+    )
+    binance = FakeBinanceClient(
+        book_tickers={
+            "FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"},
+            "BARUSDT": {"askPrice": "100.0", "bidPrice": "99.5"},
+            "BAZUSDT": {"askPrice": "100.0", "bidPrice": "99.5"},
+        },
+        spot_exchange_info=_padded_exchange_info({"BARUSDT", "BAZUSDT"}),
+        # FOOUSDT (perp hedge) absent -- delisted; response otherwise healthy.
+        perp_exchange_info=_padded_exchange_info(set(), contract_type="PERPETUAL"),
+    )
+
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour1)
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions, "first sighting must only warn, not close yet"
+
+    hour2 = journal.hour_bucket(T0 + timedelta(hours=25))  # a day later -- delist check due again
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour2)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions, "second consecutive check must force-exit"
+    assert "BARUSDT" in state.open_positions
+    assert "BAZUSDT" in state.open_positions
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    closed = [e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED]
+    assert len(closed) == 1
+    assert closed[0]["symbol"] == "FOOUSDT"
+    assert closed[0]["exit_reason"] == "hedge_delisted"
+
+
+def test_hedge_delist_check_runs_even_when_universe_scan_disabled(tmp_path: Path) -> None:
+    """The hedge-delisting check runs on its OWN daily cadence
+    REGARDLESS of `cfg.universe_scan.enabled` -- an open position must
+    never be exposed to a delisted hedge indefinitely just because the
+    scanner feature happens to be off. Same construction as the scan
+    -enabled hard-removal test above, but with universe_scan left at its
+    default (disabled) -- the delist check still fetches its own
+    exchangeInfo independently and still force-exits on the second
+    consecutive sighting.
+    """
+    bar_spec = SymbolSpec(
+        symbol="BARUSDT", hl_coin="BAR", hedge_mode=HedgeMode.SPOT, max_notional=10_000
+    )
+    baz_spec = SymbolSpec(
+        symbol="BAZUSDT", hl_coin="BAZ", hedge_mode=HedgeMode.SPOT, max_notional=10_000
+    )
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC, bar_spec, baz_spec], maker_fill_prob=1.0,
+        max_positions=3,
+        # universe_scan left at its default: enabled=False.
+    )
+    foo_position = _liquidation_test_position()  # symbol=FOOUSDT, hedge_mode=PERP
+    bar_position = Position(
+        symbol="BARUSDT", hl_coin="BAR", hedge_mode=HedgeMode.SPOT, qty=10.0,
+        notional_entry=1000.0, entry_ts=T0,
+        entry_fills=[
+            Fill(venue="hyperliquid", leg="hl_short", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=True, ts=T0),
+            Fill(venue="binance", leg="hedge_long", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=False, ts=T0),
+        ],
+        funding_received_usd=0.0, funding_paid_usd=0.0, signal_apr_at_entry=0.5,
+    )
+    baz_position = bar_position.model_copy(update={"symbol": "BAZUSDT", "hl_coin": "BAZ"})
+    for pos in (foo_position, bar_position, baz_position):
+        journal.append_event(cfg, journal.POSITION_OPENED, pos.model_dump(mode="json"), T0)
+
+    hl = FakeHLClient(
+        ctxs={
+            "FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0),
+            "BAR": FakeAssetCtx(coin="BAR", funding_hourly=0.0001, mark_px=100.0),
+            "BAZ": FakeAssetCtx(coin="BAZ", funding_hourly=0.0001, mark_px=100.0),
+        },
+        books={
+            "FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0),
+            "BAR": FakeBookTop(coin="BAR", best_bid=99.0, best_ask=101.0),
+            "BAZ": FakeBookTop(coin="BAZ", best_bid=99.0, best_ask=101.0),
+        },
+    )
+    binance = FakeBinanceClient(
+        book_tickers={
+            "FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"},
+            "BARUSDT": {"askPrice": "100.0", "bidPrice": "99.5"},
+            "BAZUSDT": {"askPrice": "100.0", "bidPrice": "99.5"},
+        },
+        spot_exchange_info=_padded_exchange_info({"BARUSDT", "BAZUSDT"}),
+        # FOOUSDT (perp hedge) absent -- delisted; response otherwise healthy.
+        perp_exchange_info=_padded_exchange_info(set(), contract_type="PERPETUAL"),
+    )
+
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour1)
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions, "first sighting must only warn, not close yet"
+
+    hour2 = journal.hour_bucket(T0 + timedelta(hours=25))
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour2)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions, (
+        "delist check must still force-exit on the 2nd check even with universe_scan disabled"
+    )
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    checks = [e for e in events if e["type"] == universe.HEDGE_DELIST_CHECKED]
+    assert len(checks) == 2  # ran on its own clock both ticks, with no scan at all
+    assert not [e for e in events if e["type"] == universe.UNIVERSE_SCANNED]
+
+
+def test_position_not_hard_delisted_when_still_tradeable_on_binance(tmp_path: Path) -> None:
+    """Sanity check for the hard-delist test above: when the hedge symbol
+    IS still TRADING on Binance, a scan tick must NOT force-exit (no
+    signal reason to either, here) -- confirms the hard-delist check
+    reads the right direction, not "always exit on a scan".
+    """
+    scan_cfg = UniverseScanConfig(enabled=True, scan_interval_hours=24)
+    cfg = _make_cfg(
+        tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0, universe_scan=scan_cfg,
+    )
+    position = _liquidation_test_position()
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), T0)
+
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"}},
+        perp_exchange_info={
+            "symbols": [
+                {"symbol": "FOOUSDT", "status": "TRADING", "quoteAsset": "USDT",
+                 "contractType": "PERPETUAL"},
+            ]
+        },
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour1)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions
+
+
+def test_hedge_delist_check_gated_at_24h_not_every_tick(tmp_path: Path) -> None:
+    """V7: the delist check's own 24h clock means two ticks only 1h apart
+    must only run ONE check -- not two, which would let a brief 1-2h API
+    blip rack up both confirmations needed to force-close within hours
+    instead of requiring a REAL, sustained (multi-day) delisting.
+    """
+    cfg = _make_cfg(tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0)
+    position = _liquidation_test_position()
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), T0)
+
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"}},
+        # FOOUSDT absent -- genuinely delisted; response otherwise healthy.
+        perp_exchange_info=_padded_exchange_info(set(), contract_type="PERPETUAL"),
+    )
+
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour1)
+    hour2 = journal.hour_bucket(T0 + timedelta(hours=2))  # only 1h later -- NOT due again
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour2)
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    checks = [e for e in events if e["type"] == universe.HEDGE_DELIST_CHECKED]
+    assert len(checks) == 1
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions  # only 1 sighting so far -- not confirmed
+
+
+def test_soft_removed_position_still_gets_signal_snapshot(tmp_path: Path) -> None:
+    """V11: a position riding its own signal after a SOFT (scanner
+    -dropped) removal must still get a SIGNAL_SNAPSHOT event every tick
+    -- direct assertion on the journal, pinning the fix from a prior
+    batch (the final snapshot loop iterates the symbol UNION, not
+    `effective_universe` alone).
+    """
+    cfg = _make_cfg(tmp_path, universe=[], max_positions=1, maker_fill_prob=1.0)
+    hour0 = journal.hour_bucket(T0)
+    spec = SymbolSpec(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=10_000
+    )
+    journal.append_event(
+        cfg, universe.UNIVERSE_MEMBER_ADDED,
+        {"symbol": "FOOUSDT", "reason": "qualified", "spec": spec.model_dump(mode="json")},
+        T0 - timedelta(hours=2),
+    )
+    journal.append_event(
+        cfg, universe.UNIVERSE_MEMBER_REMOVED,
+        {"symbol": "FOOUSDT", "reason": "degraded"},
+        T0 - timedelta(hours=1),
+    )
+    position = Position(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, qty=10.0,
+        notional_entry=1000.0, entry_ts=hour0,
+        entry_fills=[
+            Fill(venue="hyperliquid", leg="hl_short", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=True, ts=hour0),
+            Fill(venue="binance", leg="hedge_long", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=False, ts=hour0),
+        ],
+        funding_received_usd=0.0, funding_paid_usd=0.0, signal_apr_at_entry=0.5,
+    )
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), hour0)
+
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}}
+    )
+
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=hour0 + timedelta(hours=1)
+    )
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    snapshots = [
+        e for e in events
+        if e["type"] == journal.SIGNAL_SNAPSHOT and e["payload"]["symbol"] == "FOOUSDT"
+    ]
+    assert len(snapshots) == 1
+
+
+def test_pin_removed_hard_closes_and_dynamic_member_may_later_reenter(tmp_path: Path) -> None:
+    """Item 2: a symbol both PINNED and (per an earlier scanner add)
+    DYNAMIC -- when the operator removes the PIN, the position closes
+    HARD immediately (exit_reason=pin_removed), regardless of its
+    dynamic membership (pin semantics are decided by OPERATOR ACTION,
+    comparing journaled pin snapshots across ticks, never by whether a
+    symbol has ever been scanner-managed). That dynamic membership is
+    still real, though: once the symbol's OWN signal later qualifies
+    again, it may legitimately re-enter as a FRESH position through its
+    dynamic membership -- this is correct behavior, not a bug, and is
+    asserted via a fresh POSITION_OPENED event (not a resurrection of
+    the old one).
+    """
+    spec = SymbolSpec(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=50_000
+    )
+    cfg_no_pin = _make_cfg(tmp_path, universe=[], max_positions=1, maker_fill_prob=1.0)
+    journal.append_event(
+        cfg_no_pin, universe.UNIVERSE_MEMBER_ADDED,
+        {"symbol": "FOOUSDT", "reason": "qualified", "spec": spec.model_dump(mode="json")},
+        T0 - timedelta(hours=2),
+    )
+    position = Position(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, qty=10.0,
+        notional_entry=1000.0, entry_ts=T0,
+        entry_fills=[
+            Fill(venue="hyperliquid", leg="hl_short", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=True, ts=T0),
+            Fill(venue="binance", leg="hedge_long", side="open", price=100.0, qty=10.0,
+                 fee_usd=0.0, is_maker=False, ts=T0),
+        ],
+        funding_received_usd=0.0, funding_paid_usd=0.0, signal_apr_at_entry=0.5,
+    )
+    journal.append_event(cfg_no_pin, journal.POSITION_OPENED, position.model_dump(mode="json"), T0)
+
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}}
+    )
+
+    # Tick 1: operator PINS the symbol too (still ALSO a dynamic member).
+    pin_spec = SymbolSpec(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=50_000
+    )
+    cfg_pinned = _make_cfg(tmp_path, universe=[pin_spec], max_positions=1, maker_fill_prob=1.0)
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    engine.run_paper("tick", cfg_pinned, hl_client=hl, binance_client=binance, now=hour1)
+    state = journal.replay(journal.journal_path(cfg_pinned))
+    assert "FOOUSDT" in state.open_positions, "pinning doesn't close anything"
+
+    # Tick 2: operator UNPINS it -- must HARD force-exit now, even though
+    # it's still (per the earlier UNIVERSE_MEMBER_ADDED) a dynamic member.
+    cfg_unpinned = _make_cfg(
+        tmp_path, universe=[], max_positions=1, maker_fill_prob=1.0,
+        ema_periods=1, enter_apr=0.12,
+    )
+    hour2 = journal.hour_bucket(T0 + timedelta(hours=2))
+    engine.run_paper("tick", cfg_unpinned, hl_client=hl, binance_client=binance, now=hour2)
+
+    state = journal.replay(journal.journal_path(cfg_unpinned))
+    assert "FOOUSDT" not in state.open_positions, "unpinning must HARD force-exit"
+    lines = journal.journal_path(cfg_unpinned).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    closed_events = [e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED]
+    assert len(closed_events) == 1
+    assert closed_events[0]["exit_reason"] == "pin_removed"
+
+    # Tick 3: feed a strongly qualifying signal -- the symbol (still
+    # absent from pins, but STILL a dynamic member -- never removed by
+    # the scanner) may legitimately re-enter as a FRESH position.
+    hl.funding["FOO"] = _hourly_rates(hour2 + timedelta(hours=1), [0.0005] * 8, "FOO")
+    hl.ctxs["FOO"] = FakeAssetCtx(coin="FOO", funding_hourly=0.0005, mark_px=100.0)
+    hour3 = journal.hour_bucket(T0 + timedelta(hours=12))
+    engine.run_paper("tick", cfg_unpinned, hl_client=hl, binance_client=binance, now=hour3)
+
+    state = journal.replay(journal.journal_path(cfg_unpinned))
+    assert "FOOUSDT" in state.open_positions, (
+        "dynamic membership still legitimately allows re-entry"
+    )
+    lines = journal.journal_path(cfg_unpinned).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    opened_events = [e for e in events if e["type"] == journal.POSITION_OPENED]
+    assert len(opened_events) == 2  # the original (pre-existing) open + this fresh re-entry
+
+
+def test_pin_removal_close_retries_after_a_crash_right_after_tick_started(tmp_path: Path) -> None:
+    """(a) reviewer repro: the removal tick journals TICK_STARTED (with
+    the new, pin-removed set) but then crashes before actually closing
+    the position -- simulated via a real HL outage on `asset_ctxs()`,
+    which `_tick` only calls AFTER journaling TICK_STARTED, so nothing
+    else in that tick runs. A LATER tick must still close it: the old
+    one-shot "previous vs current" comparison would never fire again
+    once the crashed tick's OWN pins snapshot (already lacking the
+    symbol) becomes the new "previous" baseline for every tick after it.
+    """
+    cfg = _make_cfg(tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0)
+    position = _liquidation_test_position()
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), T0)
+
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"}})
+
+    # Tick 1: pin present -- establishes pin history.
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour1)
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" in state.open_positions
+
+    # Tick 2: pin removed AND the tick crashes right after TICK_STARTED.
+    cfg_removed = _make_cfg(tmp_path, universe=[], max_positions=1)
+    crashing_hl = FakeHLClient(raise_on_asset_ctxs=True)
+    hour2 = journal.hour_bucket(T0 + timedelta(hours=2))
+    with pytest.raises(RuntimeError):
+        engine.run_paper(
+            "tick", cfg_removed, hl_client=crashing_hl, binance_client=binance, now=hour2
+        )
+    state = journal.replay(journal.journal_path(cfg_removed))
+    assert "FOOUSDT" in state.open_positions, "still open after the simulated crash"
+
+    # Tick 3: a normal tick runs -- must STILL close it (sticky retry),
+    # even though tick 2's OWN "pins" snapshot (already empty) would make
+    # a one-shot "previous vs current" comparison see no transition here.
+    hour3 = journal.hour_bucket(T0 + timedelta(hours=3))
+    engine.run_paper("tick", cfg_removed, hl_client=hl, binance_client=binance, now=hour3)
+
+    state = journal.replay(journal.journal_path(cfg_removed))
+    assert "FOOUSDT" not in state.open_positions, "must retry the pin-removal close on a later tick"
+    lines = journal.journal_path(cfg_removed).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    closed = next(e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED)
+    assert closed["exit_reason"] == "pin_removed"
+
+
+def test_pin_removal_close_retries_after_exit_blocked(tmp_path: Path) -> None:
+    """(b) reviewer repro: the removal tick has NO live HL context for
+    the coin this tick (so the close is blocked, journaled as
+    exit_blocked) -- once a live context returns on a LATER tick, the
+    close must still fire (sticky retry), not be silently abandoned.
+    """
+    cfg = _make_cfg(tmp_path, universe=[PERP_SPEC], maker_fill_prob=1.0)
+    position = _liquidation_test_position()
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), T0)
+
+    hl_with_ctx = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"}})
+
+    # Tick 1: pin present -- establishes pin history.
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    engine.run_paper("tick", cfg, hl_client=hl_with_ctx, binance_client=binance, now=hour1)
+
+    # Tick 2: pin removed, but HL has NO context for "FOO" this tick --
+    # the close is blocked (can_price=False), journaled as exit_blocked.
+    cfg_removed = _make_cfg(tmp_path, universe=[], max_positions=1)
+    hl_without_ctx = FakeHLClient(
+        ctxs={}, books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    hour2 = journal.hour_bucket(T0 + timedelta(hours=2))
+    engine.run_paper(
+        "tick", cfg_removed, hl_client=hl_without_ctx, binance_client=binance, now=hour2
+    )
+    state = journal.replay(journal.journal_path(cfg_removed))
+    assert "FOOUSDT" in state.open_positions, "exit_blocked -- still open"
+    lines = journal.journal_path(cfg_removed).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    warnings = [e for e in events if e["type"] == journal.WARNING]
+    assert any("no live HL context" in w["payload"]["message"] for w in warnings)
+
+    # Tick 3: HL context returns -- must close NOW (sticky retry).
+    hour3 = journal.hour_bucket(T0 + timedelta(hours=3))
+    engine.run_paper("tick", cfg_removed, hl_client=hl_with_ctx, binance_client=binance, now=hour3)
+
+    state = journal.replay(journal.journal_path(cfg_removed))
+    assert "FOOUSDT" not in state.open_positions, "must retry once HL context returns"
+    lines = journal.journal_path(cfg_removed).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    closed = next(e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED)
+    assert closed["exit_reason"] == "pin_removed"
+
+
+def test_pin_removal_migration_fallback_closes_when_no_pin_history_exists(tmp_path: Path) -> None:
+    """(c) migration case: a journal written ENTIRELY before this
+    feature existed (no TICK_STARTED event anywhere carries a "pins"
+    key) with an open position whose symbol is absent from the CURRENT
+    config's pins (and not a dynamic member either) must still force
+    -close -- the pre-dynamic-universe HEAD behavior, since there's no
+    pin history yet to retry a removal against. This is what makes a pin
+    removed in the SAME deploy window this feature ships in still close.
+    """
+    cfg = _make_cfg(tmp_path, universe=[], max_positions=1, maker_fill_prob=1.0)
+    position = _liquidation_test_position()
+    journal.append_event(cfg, journal.POSITION_OPENED, position.model_dump(mode="json"), T0)
+    # An OLD-SCHEMA tick_started event with NO "pins" key at all.
+    journal.append_event(cfg, journal.TICK_STARTED, {"hour": T0.isoformat()}, T0)
+
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0001, mark_px=100.0)},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "99.5"}})
+
+    hour1 = journal.hour_bucket(T0 + timedelta(hours=1))
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour1)
+
+    state = journal.replay(journal.journal_path(cfg))
+    assert "FOOUSDT" not in state.open_positions, "migration fallback must still force-close"
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    closed = next(e["payload"] for e in events if e["type"] == journal.POSITION_CLOSED)
+    assert closed["exit_reason"] == "pin_removed"
+
+
+# --------------------------------------------------------------------------
+# 18. Dynamic universe scanner integration (M2.5): the scan running
+#     inside a tick, journaled hysteresis, and never wiping membership on
+#     a scanner outage.
+# --------------------------------------------------------------------------
+
+
+def _rich_hl_fixture(symbol: str, coin: str, rate: float, now: datetime) -> tuple[dict, dict]:
+    """A coin/symbol pair that easily qualifies the default-permissive
+    scan criteria used by the tests below: rich OI, 95 days of HOURLY
+    history (hourly, not daily -- the scanner's own age/carry probe only
+    needs a representative sample, but the SAME funding_history data also
+    feeds `_hourly_funding_series`/`signal_apr` for the actual trading
+    decision, which needs real hourly granularity in its own short recent
+    lookback window to warm up its rolling-8h-sum EMA at all), and a
+    trailing carry well above a typical threshold.
+    """
+    hours = 95 * 24
+    start = now - timedelta(hours=hours)
+    history = [
+        FakeFundingEvent(coin=coin, time=start + timedelta(hours=i), rate=rate)
+        for i in range(hours + 1)
+    ]
+    ctx = {coin: FakeAssetCtx(coin=coin, funding_hourly=rate, mark_px=1.0, open_interest=1e9)}
+    return ctx, {coin: history}
+
+
+def test_universe_scan_add_requires_consecutive_qualifying_scans_then_enters(
+    tmp_path: Path,
+) -> None:
+    """End-to-end through `_tick`: a qualifying candidate is NOT added
+    after a single scan, but IS added after `add_after_scans` consecutive
+    qualifying scans -- and (since the scan now runs at the END of the
+    tick, AFTER entries/exits are already decided) only becomes an entry
+    CANDIDATE starting the tick AFTER it was added, actually entering on
+    a third tick. A mutant that adds on the first scan would show BARUSDT
+    entered already by the second tick, failing that assertion.
+    """
+    scan_cfg = UniverseScanConfig(
+        enabled=True, scan_interval_hours=24, min_open_interest_usd=1.0,
+        min_history_days=90, min_trailing_carry_apr=0.05, add_after_scans=2,
+        remove_after_scans=3, max_dynamic_members=5, default_max_notional=10_000,
+    )
+    cfg = _make_cfg(
+        tmp_path, universe=[], maker_fill_prob=1.0, max_positions=1,
+        ema_periods=1, enter_apr=0.12, universe_scan=scan_cfg,
+    )
+    now0 = T0
+    ctx, funding = _rich_hl_fixture("BARUSDT", "BAR", 0.0003, now0)  # ~drama-free positive carry
+    # Extend the hourly series PAST now0 too -- this test runs 3 ticks
+    # spanning 48h total, and the trading signal's own (short, ~33h)
+    # lookback window needs HOURLY coverage right up to each tick's own
+    # time, not just the scan's age/carry probe window ending at now0.
+    funding["BAR"] += _hourly_rates(now0 + timedelta(hours=1), [0.0003] * 60, "BAR")
+    hl = FakeHLClient(
+        ctxs=ctx, funding=funding,
+        books={"BAR": FakeBookTop(coin="BAR", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"BARUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}},
+        spot_exchange_info={
+            "symbols": [{"symbol": "BARUSDT", "status": "TRADING", "quoteAsset": "USDT"}]
+        },
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=now0)
+    state = journal.replay(journal.journal_path(cfg))
+    assert "BARUSDT" not in state.open_positions, "must NOT enter after a single qualifying scan"
+
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=now0 + timedelta(hours=24)
+    )
+    state = journal.replay(journal.journal_path(cfg))
+    assert "BARUSDT" not in state.open_positions, (
+        "the SECOND scan adds BARUSDT at the end of this tick -- too late to enter THIS tick"
+    )
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    added = [e for e in events if e["type"] == universe.UNIVERSE_MEMBER_ADDED]
+    assert len(added) == 1
+    assert added[0]["payload"]["reason"] == "qualified"
+
+    # Third tick: BARUSDT is now in the effective universe from the START
+    # of this tick (added at the END of the previous one) -- it enters.
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=now0 + timedelta(hours=48)
+    )
+    state = journal.replay(journal.journal_path(cfg))
+    assert "BARUSDT" in state.open_positions, "must enter once it's an effective-universe member"
+
+
+def test_universe_scan_failure_journals_warning_and_keeps_previous_membership(
+    tmp_path: Path,
+) -> None:
+    """A scanner outage (Binance exchangeInfo API error during the scan)
+    must warn and leave the PREVIOUS membership exactly as it was --
+    never wipe a dynamic member just because this tick's fetch failed.
+    Pre-seed one dynamic member directly via a UNIVERSE_MEMBER_ADDED
+    event (as if a prior scan had added it), then run a tick whose scan
+    is due but whose Binance exchangeInfo fetch raises.
+    """
+    scan_cfg = UniverseScanConfig(enabled=True, scan_interval_hours=24)
+    cfg = _make_cfg(tmp_path, universe=[], maker_fill_prob=1.0, universe_scan=scan_cfg)
+    existing_spec = SymbolSpec(
+        symbol="BARUSDT", hl_coin="BAR", hedge_mode=HedgeMode.SPOT, max_notional=10_000
+    )
+    journal.append_event(
+        cfg, universe.UNIVERSE_SCANNED,
+        {
+            "hour": T0.isoformat(), "candidates": [existing_spec.model_dump(mode="json")],
+            "dropped_invalid_names": [], "qualify_streak": {}, "disqualify_streak": {},
+            "criteria_snapshot": scan_cfg.model_dump(mode="json"),
+        },
+        T0,
+    )
+    journal.append_event(
+        cfg, universe.UNIVERSE_MEMBER_ADDED,
+        {"symbol": "BARUSDT", "reason": "qualified", "spec": existing_spec.model_dump(mode="json")},
+        T0,
+    )
+
+    hour_due = T0 + timedelta(hours=25)  # past scan_interval_hours=24 -- a new scan is due
+    # Binance exchangeInfo (not HL's asset_ctxs, which the REST of the
+    # tick's own trading-signal logic also depends on and isn't what's
+    # under test here) is what fails -- a scan-specific outage, isolated
+    # from the rest of the tick.
+    hl = FakeHLClient()
+    binance = FakeBinanceClient(raise_on_exchange_info=True)
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour_due)
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    new_scans = [
+        e for e in events
+        if e["type"] == universe.UNIVERSE_SCANNED and e["ts"] != T0.isoformat()
+    ]
+    assert not new_scans, "a failed scan must not journal a NEW universe_scanned event"
+    assert not [e for e in events if e["type"] == universe.UNIVERSE_MEMBER_REMOVED]
+    warnings = [e for e in events if e["type"] == journal.WARNING]
+    assert any("universe scan failed" in w["payload"]["message"] for w in warnings)
+
+    # Replaying the raw events must still show BARUSDT as a member --
+    # membership survived the outage untouched.
+    all_events = _read_all_events_test_helper(cfg)
+    membership = universe.replay_membership(all_events)
+    assert "BARUSDT" in membership.dynamic_members
+
+    # AND the in-memory membership used for THIS SAME tick's own
+    # decisions must also be unaffected (not just what later replay sees)
+    # -- a mutant that returns a WIPED membership object on failure
+    # (rather than the same one, untouched) would still pass the replay
+    # check above (the journal itself is unaffected either way) but would
+    # drop BARUSDT from THIS tick's effective universe, so it would never
+    # get a SIGNAL_SNAPSHOT this tick.
+    snapshots_this_tick = [
+        e for e in events
+        if e["type"] == journal.SIGNAL_SNAPSHOT and e["payload"]["symbol"] == "BARUSDT"
+    ]
+    assert len(snapshots_this_tick) == 1
+
+
+def _read_all_events_test_helper(cfg: PaperConfig) -> list[dict]:
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    return [json.loads(line) for line in lines]
 
 
 # --------------------------------------------------------------------------
@@ -1921,7 +2764,7 @@ def test_last_gate_scan_tolerates_pre_spread_gate_journal_entries(tmp_path: Path
     import json as _json
 
     from farb.paper import journal as pj
-    from farb.paper.engine import _last_binance_gate_by_symbol
+    from farb.paper.engine import _last_binance_gate_by_symbol, _read_all_events
     from farb.paper.models import PaperConfig
 
     cfg = PaperConfig(universe=[], journal_dir=tmp_path)
@@ -1941,6 +2784,88 @@ def test_last_gate_scan_tolerates_pre_spread_gate_journal_entries(tmp_path: Path
         f.write(_json.dumps(old_event) + "\n")
         f.write(_json.dumps(new_event) + "\n")
 
-    last = _last_binance_gate_by_symbol(cfg)
+    last = _last_binance_gate_by_symbol(_read_all_events(cfg))
     assert "PUMPUSDT" not in last  # unknown, not a crash
     assert last["UNIUSDT"] == "absolute"
+
+
+# --------------------------------------------------------------------------
+# 19. Review-batch test gaps: U8 (scan interval gating), U13 (pin+dynamic
+#     dedup in the effective universe).
+# --------------------------------------------------------------------------
+
+
+def test_universe_scan_runs_once_per_interval_not_every_tick_within_it(tmp_path: Path) -> None:
+    """U8: two ticks only 1 hour apart, well inside scan_interval_hours=24
+    -- only the FIRST one may run a scan; the second must see "not due"
+    and journal no second UNIVERSE_SCANNED event.
+    """
+    scan_cfg = UniverseScanConfig(enabled=True, scan_interval_hours=24)
+    cfg = _make_cfg(tmp_path, universe=[], maker_fill_prob=1.0, universe_scan=scan_cfg)
+    hl = FakeHLClient()
+    binance = FakeBinanceClient()
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=T0)
+    engine.run_paper(
+        "tick", cfg, hl_client=hl, binance_client=binance, now=T0 + timedelta(hours=1)
+    )
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    scans = [e for e in events if e["type"] == universe.UNIVERSE_SCANNED]
+    assert len(scans) == 1
+
+
+def test_effective_universe_dedups_a_symbol_that_is_both_pin_and_stale_dynamic_member(
+    tmp_path: Path,
+) -> None:
+    """U13: a symbol that is BOTH a config pin AND (per a stale journal
+    entry, e.g. from before it was pinned) still nominally a dynamic
+    member must appear EXACTLY ONCE in the effective universe -- not
+    twice, which would let it become TWO SEPARATE entry candidates in
+    the SAME tick (neither one skipped by the "already open" check,
+    since NEITHER has opened yet when candidates are built) and, with
+    enough free slots, actually open the SAME symbol twice. Two free
+    slots (max_positions=2) specifically so a duplication bug manifests
+    as two POSITION_OPENED events, not masked by a single-slot cap.
+    """
+    pin_spec = SymbolSpec(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=50_000
+    )
+    stale_dynamic_spec = SymbolSpec(
+        symbol="FOOUSDT", hl_coin="FOO", hedge_mode=HedgeMode.SPOT, max_notional=50_000
+    )
+    cfg = _make_cfg(
+        tmp_path, universe=[pin_spec], maker_fill_prob=1.0, max_positions=2,
+        ema_periods=1, enter_apr=0.12,
+    )
+    journal.append_event(
+        cfg, universe.UNIVERSE_MEMBER_ADDED,
+        {
+            "symbol": "FOOUSDT", "reason": "qualified",
+            "spec": stale_dynamic_spec.model_dump(mode="json"),
+        },
+        T0 - timedelta(hours=1),
+    )
+    hour0 = journal.hour_bucket(T0)
+    hl_rates = _hourly_rates(hour0 - timedelta(hours=8), [0.0005] * 8, "FOO")
+    hl = FakeHLClient(
+        ctxs={"FOO": FakeAssetCtx(coin="FOO", funding_hourly=0.0005, mark_px=100.0)},
+        funding={"FOO": hl_rates},
+        books={"FOO": FakeBookTop(coin="FOO", best_bid=99.0, best_ask=101.0)},
+    )
+    binance = FakeBinanceClient(
+        book_tickers={"FOOUSDT": {"askPrice": "100.0", "bidPrice": "100.0"}}
+    )
+
+    engine.run_paper("tick", cfg, hl_client=hl, binance_client=binance, now=hour0)
+
+    lines = journal.journal_path(cfg).read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    opened = [e for e in events if e["type"] == journal.POSITION_OPENED]
+    assert len(opened) == 1, "pin+stale-dynamic duplication must not open the same symbol twice"
+    snapshots = [
+        e for e in events
+        if e["type"] == journal.SIGNAL_SNAPSHOT and e["payload"]["symbol"] == "FOOUSDT"
+    ]
+    assert len(snapshots) == 1  # not logged twice for the same symbol in one tick

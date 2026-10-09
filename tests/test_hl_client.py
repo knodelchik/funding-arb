@@ -93,6 +93,51 @@ def test_funding_history_full_then_short_batch_paginates_forward_no_dupes() -> N
 
 
 @respx.mock
+def test_funding_history_end_ms_bounds_result_and_stops_pagination() -> None:
+    """`end_ms` excludes events at/after it from the result AND stops
+    pagination once the fetched range reaches it -- a bounded probe must
+    not keep paginating all the way to the present just because the
+    first page happened to be full.
+    """
+    route = respx.post(INFO_URL)
+    full_batch = [
+        {"time": START_MS + i, "fundingRate": "0.0000125"} for i in range(FUNDING_HISTORY_PAGE_SIZE)
+    ]
+    end_ms = START_MS + 10  # well inside the first (full) batch
+    route.side_effect = [httpx.Response(200, json=full_batch)]
+
+    with HLClient() as client:
+        events = client.funding_history("BTC", START_MS, end_ms)
+
+    assert route.call_count == 1  # never asked for a second page past end_ms
+    assert len(events) == 10
+    assert all(e.time.timestamp() * 1000 < end_ms for e in events)
+
+
+@respx.mock
+def test_funding_history_end_ms_none_is_unbounded_as_before() -> None:
+    """Omitting `end_ms` (the default) must behave exactly as before --
+    backward compatible, paginating all the way to a short/empty batch.
+    """
+    route = respx.post(INFO_URL)
+    full_batch = [
+        {"time": START_MS + i, "fundingRate": "0.0000125"} for i in range(FUNDING_HISTORY_PAGE_SIZE)
+    ]
+    short_start = START_MS + FUNDING_HISTORY_PAGE_SIZE
+    short_batch = [{"time": short_start + i, "fundingRate": "0.00002"} for i in range(7)]
+    route.side_effect = [
+        httpx.Response(200, json=full_batch),
+        httpx.Response(200, json=short_batch),
+    ]
+
+    with HLClient() as client:
+        events = client.funding_history("BTC", START_MS)
+
+    assert route.call_count == 2
+    assert len(events) == FUNDING_HISTORY_PAGE_SIZE + 7
+
+
+@respx.mock
 def test_retries_on_500_then_succeeds() -> None:
     """A single 500 must be retried (not raised) and succeed on the next try."""
     route = respx.post(INFO_URL)

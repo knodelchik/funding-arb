@@ -83,3 +83,10 @@ symbol = "LTCUSDT"
 hl_coin = "LTC"
 hedge_mode = "spot"
 max_notional = 20000
+
+[universe_scan]
+# Daily self-managed universe: scanner adds/retires dynamic members on top of
+# the pins above. Defaults documented in farb.paper.models.UniverseScanConfig
+# (OI >= $7M, age >= 90d, 30d carry >= 8%, add after 2 scans / remove after 7,
+# max 12 dynamic members). Enabled 2026-10-09.
+enabled = true

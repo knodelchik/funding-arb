@@ -234,12 +234,20 @@ class HLClient:
             )
         return result
 
-    def funding_history(self, coin: str, start_ms: int) -> list[FundingEvent]:
+    def funding_history(
+        self, coin: str, start_ms: int, end_ms: int | None = None
+    ) -> list[FundingEvent]:
         """POST {"type": "fundingHistory", "coin": coin, "startTime": start_ms}.
 
         Forward-paginates like farb.data.client's Binance pagination: next
         startTime = last event's time + 1, stop when the batch is shorter
         than a full page (FUNDING_HISTORY_PAGE_SIZE) or empty.
+
+        `end_ms` (optional, default None = unbounded, the original
+        behavior) excludes any event at/after it from the result AND
+        stops pagination once the fetched range reaches it — a caller
+        that only needs a bounded window (e.g. "does history reach back
+        this far") doesn't pay for paginating all the way to the present.
         """
         events: list[FundingEvent] = []
         next_start = start_ms
@@ -252,15 +260,20 @@ class HLClient:
             if not batch:
                 break
             for row in batch:
+                row_ms = int(row["time"])
+                if end_ms is not None and row_ms >= end_ms:
+                    continue
                 events.append(
                     FundingEvent(
                         coin=coin,
-                        time=_from_ms(int(row["time"])),
+                        time=_from_ms(row_ms),
                         rate=_finite_float(row["fundingRate"], field="fundingRate", coin=coin),
                     )
                 )
             next_start = int(batch[-1]["time"]) + 1
             if len(batch) < FUNDING_HISTORY_PAGE_SIZE:
+                break
+            if end_ms is not None and next_start >= end_ms:
                 break
         return events
 
